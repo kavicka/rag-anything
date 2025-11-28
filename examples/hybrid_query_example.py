@@ -180,9 +180,6 @@ async def example_comparison_queries(rag: RAGAnything):
     
     comparison_queries = [
         "Compare the performance metrics between different methods mentioned in the document",
-        "What are the differences between the approaches discussed in the tables?",
-        "Compare the accuracy and speed metrics across all methods in the performance tables",
-        "What are the key differences between the techniques described in the document?",
     ]
     
     for i, query in enumerate(comparison_queries, 1):
@@ -581,28 +578,8 @@ async def main():
         print("3. The database files exist in the working directory")
         return
     
-    # Run single query if provided
-    if args.query:
-        print("="*80)
-        print("RUNNING SINGLE QUERY")
-        print("="*80)
-        print(f"\nQuery: {args.query}")
-        print("-" * 80)
-        try:
-            result = await rag.aquery(args.query, mode="hybrid", vlm_enhanced=False)
-            if result and isinstance(result, str):
-                print(f"\nAnswer:\n{result}\n")
-            else:
-                print(f"\nAnswer: {result}\n")
-        except Exception as e:
-            error_msg = str(e) if e else "Unknown error"
-            print(f"Error: {error_msg}")
-            print("\nMake sure you have processed documents into the database first.")
-            print("Also check your API key and base URL configuration.")
-            import traceback
-            print(f"\nFull error details:\n{traceback.format_exc()}")
     # Run specific example types if requested
-    elif args.multi_query or args.multi_hop or args.decomposition or args.cross_document:
+    if args.multi_query or args.multi_hop or args.decomposition or args.cross_document:
         try:
             if args.multi_query:
                 await example_multi_query_sequential(rag)
@@ -621,7 +598,26 @@ async def main():
             print("\nMake sure you have processed documents into the database first.")
             print("Use raganything_example.py or another script to process documents.")
     else:
-        # Run all query examples
+        # Run single query (default or provided via --query)
+        query = args.query if args.query else "What is the design phase of project Housing_Concrete?"
+        print("="*80)
+        print("RUNNING QUERY")
+        print("="*80)
+        print(f"\nQuery: {query}")
+        print("-" * 80)
+        try:
+            result = await rag.aquery(query, mode="hybrid", vlm_enhanced=False)
+            if result and isinstance(result, str):
+                print(f"\nAnswer:\n{result}\n")
+            else:
+                print(f"\nAnswer: {result}\n")
+        except Exception as e:
+            error_msg = str(e) if e else "Unknown error"
+            print(f"Error: {error_msg}")
+            print("\nMake sure you have processed documents into the database first.")
+            print("Also check your API key and base URL configuration.")
+            import traceback
+            print(f"\nFull error details:\n{traceback.format_exc()}")
         try:
             # Basic hybrid query examples
             await example_comparison_queries(rag)
