@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { MessageCircle, Upload, Settings, Send, FileText, Trash2, CheckCircle, Clock, Play, X, Square, AlertCircle, LogOut } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import rehypeRaw from 'rehype-raw'
 import config, { buildApiUrl, fetchWithAuth } from './config'
 import { useAuth } from './auth/AuthContext'
 import Login from './auth/Login'
@@ -893,6 +896,61 @@ const App: React.FC = () => {
         )
     }
 
+    // Formatted message component for rendering markdown/HTML
+    const FormattedMessage: React.FC<{ content: string; isUser: boolean }> = ({ content, isUser }) => {
+        // For user messages, just show plain text
+        if (isUser) {
+            return <p className="text-sm whitespace-pre-line">{content}</p>
+        }
+
+        // For assistant messages, render markdown and HTML
+        return (
+            <div className="text-sm">
+                <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeRaw]}
+                    components={{
+                        // Style headings
+                        h1: ({ node, ...props }) => <h1 className="text-lg font-bold mb-2 mt-3 first:mt-0" {...props} />,
+                        h2: ({ node, ...props }) => <h2 className="text-base font-bold mb-2 mt-3 first:mt-0" {...props} />,
+                        h3: ({ node, ...props }) => <h3 className="text-sm font-bold mb-1 mt-2 first:mt-0" {...props} />,
+                        // Style paragraphs
+                        p: ({ node, ...props }) => <p className="mb-2 last:mb-0 whitespace-pre-wrap" {...props} />,
+                        // Style lists
+                        ul: ({ node, ...props }) => <ul className="list-disc list-inside mb-2 space-y-1" {...props} />,
+                        ol: ({ node, ...props }) => <ol className="list-decimal list-inside mb-2 space-y-1" {...props} />,
+                        li: ({ node, ...props }) => <li className="ml-2" {...props} />,
+                        // Style bold and italic
+                        strong: ({ node, ...props }) => <strong className="font-bold" {...props} />,
+                        em: ({ node, ...props }) => <em className="italic" {...props} />,
+                        // Style code blocks
+                        code: ({ node, inline, ...props }: any) => (inline ? <code className="bg-gray-300 px-1 py-0.5 rounded text-xs font-mono" {...props} /> : <code className="block bg-gray-300 p-2 rounded text-xs font-mono overflow-x-auto" {...props} />),
+                        pre: ({ node, ...props }) => <pre className="bg-gray-300 p-2 rounded text-xs font-mono overflow-x-auto mb-2" {...props} />,
+                        // Style blockquotes
+                        blockquote: ({ node, ...props }) => <blockquote className="border-l-4 border-gray-400 pl-2 italic my-2" {...props} />,
+                        // Style links
+                        a: ({ node, ...props }) => <a className="text-blue-600 underline" target="_blank" rel="noopener noreferrer" {...props} />,
+                        // Style divs (for HTML content)
+                        div: ({ node, ...props }: any) => <div className="mb-2 last:mb-0" {...props} />,
+                        // Style tables
+                        table: ({ node, ...props }: any) => (
+                            <div className="overflow-x-auto my-3">
+                                <table className="min-w-full border-collapse border border-gray-300 text-xs" {...props} />
+                            </div>
+                        ),
+                        thead: ({ node, ...props }: any) => <thead className="bg-gray-100" {...props} />,
+                        tbody: ({ node, ...props }: any) => <tbody {...props} />,
+                        tr: ({ node, ...props }: any) => <tr className="border-b border-gray-200 hover:bg-gray-50" {...props} />,
+                        th: ({ node, ...props }: any) => <th className="border border-gray-300 px-2 py-1 text-left font-semibold" {...props} />,
+                        td: ({ node, ...props }: any) => <td className="border border-gray-300 px-2 py-1" {...props} />,
+                    }}
+                >
+                    {content}
+                </ReactMarkdown>
+            </div>
+        )
+    }
+
     // Step progress component
     const StepProgress: React.FC<{ steps: UploadStep[] }> = ({ steps }) => {
         return (
@@ -962,7 +1020,7 @@ const App: React.FC = () => {
                         return (
                             <div key={message.id} className={`flex ${message.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
                                 <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${message.sender === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
-                                    {parsedMessage.text && <p className="text-sm whitespace-pre-line">{parsedMessage.text}</p>}
+                                    {parsedMessage.text && <FormattedMessage content={parsedMessage.text} isUser={message.sender === 'user'} />}
                                     {message.sender === 'assistant' && parsedMessage.tables.length > 0 && <TableDisplay tables={parsedMessage.tables} />}
                                     {message.loading && (
                                         <div className="flex items-center mt-2">
