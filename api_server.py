@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import bcrypt
 from jose import JWTError, jwt
+import aiosqlite
 
 # Add project root directory to Python path
 import sys
@@ -46,6 +47,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Filter to suppress status endpoint access logs
+class StatusEndpointFilter(logging.Filter):
+    """Filter out access logs for status endpoints"""
+    def filter(self, record):
+        # Filter out uvicorn access logs for paths ending with /status
+        message = record.getMessage()
+        if "/status" in message and "GET" in message:
+            return False
+        return True
+
+# Apply filter to uvicorn access logger
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.addFilter(StatusEndpointFilter())
+
 # ============================================================================
 # Authentication Configuration
 # ============================================================================
@@ -60,6 +75,57 @@ security = HTTPBearer()
 
 # Users file path
 USERS_FILE = Path(__file__).parent / "users.json"
+
+# Database file path
+DB_FILE = Path(__file__).parent / "chats.db"
+
+# ============================================================================
+# Database Setup
+# ============================================================================
+
+async def init_database():
+    """Initialize SQLite database with tables and indexes"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Create chats table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                is_temporary BOOLEAN NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_message_at TEXT
+            )
+        """)
+        
+        # Create messages table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Create indexes for performance
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_id_updated ON chats(user_id, updated_at DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id_timestamp ON messages(chat_id, timestamp)")
+        
+        await db.commit()
+        logger.info("Database initialized successfully")
+
+async def get_db():
+    """Get database connection"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        yield db
 
 # ============================================================================
 # Authentication Functions
@@ -179,6 +245,29 @@ class ErrorResponse(BaseModel):
     code: str
     details: Optional[Dict[str, Any]] = None
 
+class Chat(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    is_temporary: bool
+    created_at: str
+    updated_at: str
+    last_message_at: Optional[str] = None
+
+class ChatListResponse(BaseModel):
+    chats: List[Chat]
+
+class ChatCreateRequest(BaseModel):
+    name: Optional[str] = None
+    is_temporary: bool = False
+
+class ChatNameUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+
+class ChatMessageRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=10000)
+    chat_id: Optional[str] = None
+
 # ============================================================================
 # RAG Manager (Singleton)
 # ============================================================================
@@ -191,11 +280,21 @@ class RAGManager:
     _initialized: bool = False
     _initializing: bool = False
     _init_error: Optional[str] = None
+    _processing_semaphore: Optional[asyncio.Semaphore] = None
     
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(RAGManager, cls).__new__(cls)
         return cls._instance
+    
+    def _get_processing_semaphore(self) -> asyncio.Semaphore:
+        """Get or create the processing semaphore for concurrency control"""
+        if self._processing_semaphore is None:
+            # Default to 1 (sequential) to match process_upload_folder.py behavior
+            max_concurrent = int(os.getenv("MAX_CONCURRENT_FILES", "1"))
+            self._processing_semaphore = asyncio.Semaphore(max_concurrent)
+            logger.info(f"Initialized file processing semaphore with max_concurrent={max_concurrent}")
+        return self._processing_semaphore
     
     async def initialize(self, api_key: str, base_url: Optional[str] = None, working_dir: str = "./rag_storage"):
         """Initialize RAG instance if not already initialized"""
@@ -215,10 +314,12 @@ class RAGManager:
             logger.info(f"Initializing RAG database from: {working_dir}")
             
             # Create RAGAnything configuration
+            output_dir = os.getenv("OUTPUT_DIR", "./output")
             config = RAGAnythingConfig(
                 working_dir=working_dir,
                 parser="mineru",  # Not used for querying, but required
                 parse_method="auto",
+                parser_output_dir=output_dir,  # Set output directory for image path resolution
                 enable_image_processing=True,
                 enable_table_processing=True,
                 enable_equation_processing=True,
@@ -342,17 +443,103 @@ class RAGManager:
         """Get initialization error if any"""
         return self._init_error
     
-    async def query(self, query_text: str, mode: str = "hybrid", timeout: int = 300) -> str:
+    def _detect_multi_document_query(self, query_text: str) -> tuple[bool, List[str]]:
+        """
+        Detect if query involves multiple documents and extract document names
+        
+        Args:
+            query_text: Query text
+            
+        Returns:
+            Tuple of (is_multi_doc, document_names)
+        """
+        import re
+        
+        # Common patterns for multi-document queries
+        multi_doc_patterns = [
+            r"compare.*?between.*?(?:and|vs|versus)",
+            r"difference.*?between.*?(?:and|vs|versus)",
+            r"similarity.*?between.*?(?:and|vs|versus)",
+            r"compare.*?documents?",
+            r"compare.*?files?",
+        ]
+        
+        query_lower = query_text.lower()
+        is_multi_doc = any(re.search(pattern, query_lower) for pattern in multi_doc_patterns)
+        
+        # Try to extract document names from query
+        # Look for patterns like "document X and document Y" or file names
+        document_names = []
+        
+        if is_multi_doc:
+            # Try to extract document names using common patterns
+            # Pattern 1: "compare X and Y"
+            compare_match = re.search(r"compare\s+(.+?)\s+(?:and|vs|versus)\s+(.+)", query_lower)
+            if compare_match:
+                doc1 = compare_match.group(1).strip()
+                doc2 = compare_match.group(2).strip()
+                # Remove common words
+                for word in ["document", "file", "the", "a", "an"]:
+                    doc1 = doc1.replace(word, "").strip()
+                    doc2 = doc2.replace(word, "").strip()
+                if doc1:
+                    document_names.append(doc1)
+                if doc2:
+                    document_names.append(doc2)
+            
+            # Pattern 2: Look for file names (common patterns)
+            # This is a simple heuristic - can be enhanced
+            file_patterns = [
+                r"([A-Za-z0-9_\-]+\.pdf)",
+                r"([A-Za-z0-9_\-]+\.docx?)",
+                r"([A-Z][a-z]+_[A-Z][a-z]+)",  # Pattern like "Housing_Concrete"
+            ]
+            
+            for pattern in file_patterns:
+                matches = re.findall(pattern, query_text)
+                document_names.extend(matches)
+        
+        # Remove duplicates and empty strings
+        document_names = list(set([name for name in document_names if name]))
+        
+        return is_multi_doc, document_names
+
+    async def query(self, query_text: str, mode: str = "hybrid", timeout: int = 300, document_names: List[str] = None) -> str:
         """Execute a query against the RAG system"""
         if not self.is_ready():
             raise RuntimeError("RAG system is not initialized")
         
         try:
-            # Execute query with timeout
-            result = await asyncio.wait_for(
-                self._rag.aquery(query_text, mode=mode),
-                timeout=timeout
-            )
+            # System prompt for Czech language - preserves citations in original language
+            czech_system_prompt = """Odpovídej vždy v češtině. Citáty a citace z dokumentů ponech vždy v původním jazyce, pokud nejsou v češtině. Nepřekládej citace z jiných jazyků.
+
+Odpovídej stručně a pouze na to, na co se uživatel ptá. Neuváděj žádné dodatečné informace, které uživatel nepožádal."""
+            
+            # Detect multi-document query if document_names not provided
+            if document_names is None:
+                is_multi_doc, detected_doc_names = self._detect_multi_document_query(query_text)
+                if is_multi_doc and len(detected_doc_names) >= 2:
+                    document_names = detected_doc_names
+                    logger.info(f"Detected multi-document query with documents: {document_names}")
+            
+            # Use multi-document query if we have 2+ document names
+            if document_names and len(document_names) >= 2:
+                logger.info(f"Using multi-document comparison for: {document_names}")
+                result = await asyncio.wait_for(
+                    self._rag.aquery_multi_document(
+                        query_text,
+                        document_names=document_names,
+                        mode=mode,
+                        system_prompt=czech_system_prompt,
+                    ),
+                    timeout=timeout
+                )
+            else:
+                # Single document query (backwards compatible)
+                result = await asyncio.wait_for(
+                    self._rag.aquery(query_text, mode=mode, system_prompt=czech_system_prompt),
+                    timeout=timeout
+                )
             
             if result and isinstance(result, str):
                 return result
@@ -365,6 +552,55 @@ class RAGManager:
             logger.error(f"Error executing query: {str(e)}", exc_info=True)
             raise
     
+    def _is_retryable_error(self, error: Exception) -> bool:
+        """
+        Determine if an error is retryable (e.g., embedding errors, connection issues)
+        
+        Args:
+            error: The exception that occurred
+            
+        Returns:
+            True if the error should trigger a retry, False otherwise
+        """
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+        
+        # Retryable errors:
+        # - Embedding errors (connection issues, timeouts, EOF)
+        # - Connection errors
+        # - Timeout errors
+        # - Service unavailable errors
+        retryable_patterns = [
+            "embedding",
+            "eof",
+            "connection",
+            "timeout",
+            "llama runner process no longer running",
+            "500",
+            "503",
+            "502",
+            "network",
+            "socket",
+            "refused",
+        ]
+        
+        retryable_types = [
+            "ConnectionError",
+            "TimeoutError",
+            "OSError",
+            "IOError",
+        ]
+        
+        # Check error message patterns
+        if any(pattern in error_str for pattern in retryable_patterns):
+            return True
+        
+        # Check error types
+        if any(retry_type in error_type for retry_type in retryable_types):
+            return True
+        
+        return False
+
     async def process_uploaded_file(
         self,
         file_path: str,
@@ -375,6 +611,8 @@ class RAGManager:
     ) -> None:
         """
         Process an uploaded file using the same logic as process_upload_folder.py
+        Uses semaphore to control concurrency (sequential by default, matching process_upload_folder.py)
+        Implements retry logic for retryable errors (e.g., embedding errors).
         
         Args:
             file_path: Path to the uploaded file
@@ -386,95 +624,241 @@ class RAGManager:
         if not self.is_ready():
             raise RuntimeError("RAG system is not initialized")
         
-        try:
-            # Initialize status tracking
-            upload_statuses[status_key] = {
-                "status": "processing",
-                "progress": 0.0,
-                "message": "Starting file processing...",
-                "steps": [
-                    {"id": "upload", "name": "Upload", "description": "File uploaded", "status": "completed", "progress": 1.0},
-                    {"id": "extract", "name": "Extract", "description": "Extracting content...", "status": "in_progress", "progress": 0.0},
-                    {"id": "chunk", "name": "Chunk", "description": "Chunking document...", "status": "pending", "progress": 0.0},
-                    {"id": "embed", "name": "Embed", "description": "Creating vectors...", "status": "pending", "progress": 0.0},
-                    {"id": "index", "name": "Index", "description": "Indexing...", "status": "pending", "progress": 0.0},
-                ],
-                "error": None,
-            }
+        # Get retry configuration
+        max_retries = int(os.getenv("PROCESSING_MAX_RETRIES", "3"))
+        retry_delay_base = float(os.getenv("PROCESSING_RETRY_DELAY_BASE", "2.0"))  # Base delay in seconds
+        
+        # Acquire semaphore to control concurrency (sequential by default)
+        semaphore = self._get_processing_semaphore()
+        async with semaphore:
+            last_error = None
             
-            # Use config defaults if not provided
-            if output_dir is None:
-                output_dir = self._rag.config.parser_output_dir
-            if parse_method is None:
-                parse_method = self._rag.config.parse_method
-            
-            logger.info(f"Processing uploaded file: {filename} (path: {file_path})")
-            
-            # Step 1: Extract (parse document)
-            upload_statuses[status_key]["steps"][1]["status"] = "in_progress"
-            upload_statuses[status_key]["steps"][1]["progress"] = 0.0
-            upload_statuses[status_key]["message"] = "Extracting content from document..."
-            upload_statuses[status_key]["progress"] = 0.1
-            
-            # Process document using the same method as process_upload_folder.py
-            await self._rag.process_document_complete(
-                file_path=file_path,
-                output_dir=output_dir,
-                parse_method=parse_method,
-                display_stats=False,
-                file_name=filename,
-            )
-            
-            # Mark extract as completed
-            upload_statuses[status_key]["steps"][1]["status"] = "completed"
-            upload_statuses[status_key]["steps"][1]["progress"] = 1.0
-            upload_statuses[status_key]["steps"][1]["description"] = "Content extracted"
-            upload_statuses[status_key]["progress"] = 0.3
-            
-            # Steps 2-5 (chunk, embed, index) are handled internally by process_document_complete
-            # We'll mark them as completed since process_document_complete does everything
-            upload_statuses[status_key]["steps"][2]["status"] = "completed"
-            upload_statuses[status_key]["steps"][2]["progress"] = 1.0
-            upload_statuses[status_key]["steps"][2]["description"] = "Document chunked"
-            upload_statuses[status_key]["progress"] = 0.5
-            
-            upload_statuses[status_key]["steps"][3]["status"] = "completed"
-            upload_statuses[status_key]["steps"][3]["progress"] = 1.0
-            upload_statuses[status_key]["steps"][3]["description"] = "Vectors created"
-            upload_statuses[status_key]["progress"] = 0.8
-            
-            upload_statuses[status_key]["steps"][4]["status"] = "completed"
-            upload_statuses[status_key]["steps"][4]["progress"] = 1.0
-            upload_statuses[status_key]["steps"][4]["description"] = "Indexed"
-            upload_statuses[status_key]["progress"] = 1.0
-            
-            # Mark as completed
-            upload_statuses[status_key]["status"] = "completed"
-            upload_statuses[status_key]["message"] = f"Successfully processed {filename}"
-            logger.info(f"Successfully processed uploaded file: {filename}")
-            
-        except Exception as e:
-            error_msg = f"Error processing file: {str(e)}"
-            logger.error(f"Error processing uploaded file {filename}: {error_msg}", exc_info=True)
-            
-            # Mark current step as error
-            for step in upload_statuses[status_key]["steps"]:
-                if step["status"] == "in_progress":
-                    step["status"] = "error"
-                    step["progress"] = 0.0
-                    break
-            
-            upload_statuses[status_key]["status"] = "error"
-            upload_statuses[status_key]["error"] = error_msg
-            upload_statuses[status_key]["message"] = f"Processing failed: {error_msg}"
-            
-            raise
+            for attempt in range(max_retries):
+                try:
+                    # Initialize/reset status tracking for each attempt
+                    if attempt == 0:
+                        upload_statuses[status_key] = {
+                            "status": "processing",
+                            "progress": 0.0,
+                            "message": "Starting file processing...",
+                            "steps": [
+                                {"id": "upload", "name": "Upload", "description": "File uploaded", "status": "completed", "progress": 1.0},
+                                {"id": "extract", "name": "Extract", "description": "Extracting content...", "status": "in_progress", "progress": 0.0},
+                                {"id": "chunk", "name": "Chunk", "description": "Chunking document...", "status": "pending", "progress": 0.0},
+                                {"id": "embed", "name": "Embed", "description": "Creating vectors...", "status": "pending", "progress": 0.0},
+                                {"id": "index", "name": "Index", "description": "Indexing...", "status": "pending", "progress": 0.0},
+                            ],
+                            "error": None,
+                            "retry_count": 0,
+                        }
+                    else:
+                        # Reset status for retry
+                        upload_statuses[status_key]["status"] = "processing"
+                        upload_statuses[status_key]["error"] = None
+                        upload_statuses[status_key]["retry_count"] = attempt
+                        upload_statuses[status_key]["message"] = f"Retrying processing (attempt {attempt + 1}/{max_retries})..."
+                        # Reset all steps
+                        for step in upload_statuses[status_key]["steps"]:
+                            if step["id"] != "upload":
+                                step["status"] = "pending"
+                                step["progress"] = 0.0
+                    
+                    # Use config defaults if not provided
+                    if output_dir is None:
+                        output_dir = self._rag.config.parser_output_dir
+                    if parse_method is None:
+                        parse_method = self._rag.config.parse_method
+                    
+                    if attempt > 0:
+                        logger.info(f"Retrying processing of uploaded file: {filename} (attempt {attempt + 1}/{max_retries})")
+                    else:
+                        logger.info(f"Processing uploaded file: {filename} (path: {file_path})")
+                    
+                    # Step 1: Extract (parse document)
+                    upload_statuses[status_key]["steps"][1]["status"] = "in_progress"
+                    upload_statuses[status_key]["steps"][1]["progress"] = 0.0
+                    upload_statuses[status_key]["message"] = "Extracting content from document..." if attempt == 0 else f"Retrying extraction (attempt {attempt + 1}/{max_retries})..."
+                    upload_statuses[status_key]["progress"] = 0.1
+                    
+                    # Process document using the same method as process_upload_folder.py
+                    await self._rag.process_document_complete(
+                        file_path=file_path,
+                        output_dir=output_dir,
+                        parse_method=parse_method,
+                        display_stats=False,
+                        file_name=filename,
+                    )
+                    
+                    # Mark extract as completed
+                    upload_statuses[status_key]["steps"][1]["status"] = "completed"
+                    upload_statuses[status_key]["steps"][1]["progress"] = 1.0
+                    upload_statuses[status_key]["steps"][1]["description"] = "Content extracted"
+                    upload_statuses[status_key]["progress"] = 0.3
+                    
+                    # Steps 2-5 (chunk, embed, index) are handled internally by process_document_complete
+                    # We'll mark them as completed since process_document_complete does everything
+                    upload_statuses[status_key]["steps"][2]["status"] = "completed"
+                    upload_statuses[status_key]["steps"][2]["progress"] = 1.0
+                    upload_statuses[status_key]["steps"][2]["description"] = "Document chunked"
+                    upload_statuses[status_key]["progress"] = 0.5
+                    
+                    upload_statuses[status_key]["steps"][3]["status"] = "completed"
+                    upload_statuses[status_key]["steps"][3]["progress"] = 1.0
+                    upload_statuses[status_key]["steps"][3]["description"] = "Vectors created"
+                    upload_statuses[status_key]["progress"] = 0.8
+                    
+                    upload_statuses[status_key]["steps"][4]["status"] = "completed"
+                    upload_statuses[status_key]["steps"][4]["progress"] = 1.0
+                    upload_statuses[status_key]["steps"][4]["description"] = "Indexed"
+                    upload_statuses[status_key]["progress"] = 1.0
+                    
+                    # Mark as completed
+                    upload_statuses[status_key]["status"] = "completed"
+                    upload_statuses[status_key]["message"] = f"Successfully processed {filename}" + (f" (after {attempt} retries)" if attempt > 0 else "")
+                    logger.info(f"Successfully processed uploaded file: {filename}" + (f" (after {attempt} retries)" if attempt > 0 else ""))
+                    return  # Success, exit retry loop
+                    
+                except Exception as e:
+                    last_error = e
+                    error_msg = f"Error processing file: {str(e)}"
+                    logger.error(f"Error processing uploaded file {filename} (attempt {attempt + 1}/{max_retries}): {error_msg}", exc_info=True)
+                    
+                    # Check if error is retryable
+                    is_retryable = self._is_retryable_error(e)
+                    is_last_attempt = (attempt + 1) >= max_retries
+                    
+                    if is_retryable and not is_last_attempt:
+                        # Calculate exponential backoff delay
+                        retry_delay = retry_delay_base * (2 ** attempt)
+                        logger.info(f"Retryable error detected. Will retry in {retry_delay:.1f} seconds...")
+                        
+                        upload_statuses[status_key]["status"] = "processing"
+                        upload_statuses[status_key]["error"] = f"Temporary error (attempt {attempt + 1}/{max_retries}): {error_msg}"
+                        upload_statuses[status_key]["message"] = f"Retrying in {retry_delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})"
+                        
+                        # Mark current step as retrying
+                        for step in upload_statuses[status_key]["steps"]:
+                            if step["status"] == "in_progress":
+                                step["status"] = "pending"  # Reset for retry
+                                step["progress"] = 0.0
+                                break
+                        
+                        # Wait before retrying
+                        await asyncio.sleep(retry_delay)
+                        continue  # Retry
+                    else:
+                        # Non-retryable error or last attempt - fail permanently
+                        logger.error(f"Processing failed permanently for {filename}: {error_msg}")
+                        
+                        # Mark current step as error
+                        for step in upload_statuses[status_key]["steps"]:
+                            if step["status"] == "in_progress":
+                                step["status"] = "error"
+                                step["progress"] = 0.0
+                                break
+                        
+                        upload_statuses[status_key]["status"] = "error"
+                        upload_statuses[status_key]["error"] = error_msg + (f" (after {attempt + 1} attempts)" if attempt > 0 else "")
+                        upload_statuses[status_key]["message"] = f"Processing failed: {error_msg}"
+                        
+                        raise  # Re-raise the exception
+
+# ============================================================================
+# Chat Name Generation Service
+# ============================================================================
+
+async def generate_chat_name(first_question: str, rag_manager: RAGManager) -> str:
+    """Generate a chat name from the first question using AI"""
+    try:
+        prompt = f"""Generate a short, descriptive title (maximum 50 characters) for this conversation based on the first question. 
+The title should be concise and capture the main topic. Return only the title, nothing else.
+
+First question: {first_question[:200]}
+
+Title:"""
+        
+        # Use a simple LLM call without RAG query
+        llm_model_name = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BINDING_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BINDING_HOST")
+        
+        result = openai_complete_if_cache(
+            llm_model_name,
+            prompt,
+            system_prompt="You are a helpful assistant that generates concise, descriptive titles for conversations.",
+            api_key=api_key,
+            base_url=base_url,
+        )
+        
+        # Clean up the result
+        name = result.strip().strip('"').strip("'")
+        if len(name) > 50:
+            name = name[:47] + "..."
+        
+        return name if name else "New Chat"
+    except Exception as e:
+        logger.error(f"Error generating chat name: {str(e)}")
+        # Fallback: use first 50 chars of question
+        fallback = first_question[:50].strip()
+        return fallback if fallback else "New Chat"
+
+async def should_update_chat_name(
+    chat_id: str, 
+    old_name: str, 
+    recent_messages: List[str],
+    rag_manager: RAGManager
+) -> Optional[str]:
+    """Check if chat name should be updated and return new name if needed"""
+    try:
+        # Only check every 5 messages to avoid excessive LLM calls
+        if len(recent_messages) < 5:
+            return None
+        
+        # Get last 5 messages
+        last_messages = recent_messages[-5:]
+        messages_text = "\n".join([f"{i+1}. {msg[:100]}" for i, msg in enumerate(last_messages)])
+        
+        prompt = f"""Analyze if the conversation topic has changed significantly. 
+Previous title: "{old_name}"
+Recent messages:
+{messages_text}
+
+If the topic has changed significantly, generate a new short title (max 50 chars). 
+If the topic is still the same, respond with "NO_CHANGE".
+Return only the new title or "NO_CHANGE", nothing else."""
+        
+        llm_model_name = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BINDING_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BINDING_HOST")
+        
+        result = openai_complete_if_cache(
+            llm_model_name,
+            prompt,
+            system_prompt="You are a helpful assistant that analyzes conversation topics.",
+            api_key=api_key,
+            base_url=base_url,
+        )
+        
+        result = result.strip().strip('"').strip("'")
+        
+        if result.upper() == "NO_CHANGE" or not result:
+            return None
+        
+        # Clean up the result
+        new_name = result.strip()
+        if len(new_name) > 50:
+            new_name = new_name[:47] + "..."
+        
+        return new_name if new_name and new_name != old_name else None
+    except Exception as e:
+        logger.error(f"Error checking chat name update: {str(e)}")
+        return None
 
 # ============================================================================
 # In-Memory Storage (can be upgraded to database later)
 # ============================================================================
 
-# In-memory chat message storage
+# In-memory chat message storage (deprecated - using database now)
 chat_messages: List[ChatMessage] = []
 
 # Upload processing status tracking
@@ -507,6 +891,9 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
     # Startup
     logger.info("Starting API server...")
+    
+    # Initialize database
+    await init_database()
     
     # Initialize RAG manager
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BINDING_API_KEY")
@@ -674,14 +1061,232 @@ async def health_check():
             message=f"RAG system not ready: {error or 'Not initialized'}"
         )
 
+# ============================================================================
+# Chat Management Endpoints
+# ============================================================================
+
+@app.post("/chats", response_model=Chat)
+async def create_chat(request: ChatCreateRequest, current_user: str = Depends(get_current_user)):
+    """Create a new chat"""
+    chat_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    name = request.name or "New Chat"
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO chats (id, user_id, name, is_temporary, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, current_user, name, request.is_temporary, now, now))
+        await db.commit()
+    
+    logger.info(f"Chat created: {chat_id} for user: {current_user}")
+    return Chat(
+        id=chat_id,
+        user_id=current_user,
+        name=name,
+        is_temporary=request.is_temporary,
+        created_at=now,
+        updated_at=now,
+        last_message_at=None
+    )
+
+@app.get("/chats", response_model=ChatListResponse)
+async def list_chats(current_user: str = Depends(get_current_user)):
+    """List all chats for current user"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, user_id, name, is_temporary, created_at, updated_at, last_message_at
+            FROM chats
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+        """, (current_user,)) as cursor:
+            rows = await cursor.fetchall()
+            chats = [
+                Chat(
+                    id=row["id"],
+                    user_id=row["user_id"],
+                    name=row["name"],
+                    is_temporary=bool(row["is_temporary"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                    last_message_at=row["last_message_at"]
+                )
+                for row in rows
+            ]
+    
+    return ChatListResponse(chats=chats)
+
+@app.get("/chats/{chat_id}", response_model=Chat)
+async def get_chat(chat_id: str, current_user: str = Depends(get_current_user)):
+    """Get chat details"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, user_id, name, is_temporary, created_at, updated_at, last_message_at
+            FROM chats
+            WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Chat not found"
+                )
+            return Chat(
+                id=row["id"],
+                user_id=row["user_id"],
+                name=row["name"],
+                is_temporary=bool(row["is_temporary"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                last_message_at=row["last_message_at"]
+            )
+
+@app.get("/chats/{chat_id}/messages", response_model=List[ChatMessage])
+async def get_chat_messages(chat_id: str, current_user: str = Depends(get_current_user)):
+    """Get messages for a specific chat"""
+    # Verify chat belongs to user
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id FROM chats WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            if not await cursor.fetchone():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Chat not found"
+                )
+        
+        # Get messages
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, content, sender, timestamp
+            FROM messages
+            WHERE chat_id = ?
+            ORDER BY timestamp ASC
+        """, (chat_id,)) as cursor:
+            rows = await cursor.fetchall()
+            messages = [
+                ChatMessage(
+                    id=row["id"],
+                    content=row["content"],
+                    sender=row["sender"],
+                    timestamp=row["timestamp"],
+                    loading=False
+                )
+                for row in rows
+            ]
+    
+    return messages
+
+@app.put("/chats/{chat_id}/name", response_model=Chat)
+async def update_chat_name(
+    chat_id: str,
+    request: ChatNameUpdateRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """Manually update chat name"""
+    now = datetime.now().isoformat()
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Verify chat belongs to user
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id FROM chats WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            if not await cursor.fetchone():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Chat not found"
+                )
+        
+        # Update name
+        await db.execute("""
+            UPDATE chats
+            SET name = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+        """, (request.name, now, chat_id, current_user))
+        await db.commit()
+        
+        # Get updated chat
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, user_id, name, is_temporary, created_at, updated_at, last_message_at
+            FROM chats
+            WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            row = await cursor.fetchone()
+            return Chat(
+                id=row["id"],
+                user_id=row["user_id"],
+                name=row["name"],
+                is_temporary=bool(row["is_temporary"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                last_message_at=row["last_message_at"]
+            )
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: str, current_user: str = Depends(get_current_user)):
+    """Delete a chat and all its messages"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Verify chat belongs to user
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id FROM chats WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            if not await cursor.fetchone():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Chat not found"
+                )
+        
+        # Delete chat (messages will be deleted via CASCADE)
+        await db.execute("DELETE FROM chats WHERE id = ? AND user_id = ?", (chat_id, current_user))
+        await db.commit()
+    
+    logger.info(f"Chat deleted: {chat_id} by user: {current_user}")
+    return {"status": "success", "message": "Chat deleted"}
+
+@app.post("/chats/{chat_id}/clear")
+async def clear_chat_messages(chat_id: str, current_user: str = Depends(get_current_user)):
+    """Clear all messages in a chat (keep the chat)"""
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Verify chat belongs to user
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id FROM chats WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            if not await cursor.fetchone():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Chat not found"
+                )
+        
+        # Delete messages
+        await db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+    
+    logger.info(f"Chat messages cleared: {chat_id} by user: {current_user}")
+    return {"status": "success", "message": "Chat messages cleared"}
+
+# ============================================================================
+# Legacy Chat Endpoints (for backward compatibility)
+# ============================================================================
+
 @app.get("/chat/messages", response_model=List[ChatMessage])
 async def get_chat_messages(current_user: str = Depends(get_current_user)):
     """Get chat message history"""
     return chat_messages
 
-@app.post("/chat/send", response_model=ChatSendResponse)
-async def send_chat_message(request: ChatSendRequest, current_user: str = Depends(get_current_user)):
-    """Send a query and get AI response"""
+@app.post("/chats/{chat_id}/messages", response_model=ChatSendResponse)
+async def send_chat_message(
+    chat_id: str,
+    request: ChatMessageRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """Send a message to a specific chat and get AI response"""
     rag_manager = RAGManager()
     
     if not rag_manager.is_ready():
@@ -694,28 +1299,114 @@ async def send_chat_message(request: ChatSendRequest, current_user: str = Depend
             }
         )
     
+    # Verify chat belongs to user
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, name FROM chats WHERE id = ? AND user_id = ?
+        """, (chat_id, current_user)) as cursor:
+            chat_row = await cursor.fetchone()
+            if not chat_row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Chat not found"
+                )
+    
     try:
         # Execute query
         query_timeout = int(os.getenv("QUERY_TIMEOUT", "300"))  # Default 5 minutes
         result = await rag_manager.query(request.content, mode="hybrid", timeout=query_timeout)
         
+        now = datetime.now().isoformat()
+        
+        # Create message IDs
+        user_message_id = f"user-{int(datetime.now().timestamp() * 1000)}-{uuid.uuid4().hex[:9]}"
+        ai_message_id = f"ai-{int(datetime.now().timestamp() * 1000)}-{uuid.uuid4().hex[:9]}"
+        
+        # Store messages in database
+        async with aiosqlite.connect(DB_FILE) as db:
+            # Insert user message
+            await db.execute("""
+                INSERT INTO messages (id, chat_id, content, sender, timestamp, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_message_id, chat_id, request.content, "user", now, now))
+            
+            # Insert assistant message
+            await db.execute("""
+                INSERT INTO messages (id, chat_id, content, sender, timestamp, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (ai_message_id, chat_id, result, "assistant", now, now))
+            
+            # Update chat's last_message_at and updated_at
+            await db.execute("""
+                UPDATE chats
+                SET last_message_at = ?, updated_at = ?
+                WHERE id = ?
+            """, (now, now, chat_id))
+            
+            await db.commit()
+        
+        # Check if we need to generate/update chat name
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            # Get message count
+            async with db.execute("""
+                SELECT COUNT(*) as count FROM messages WHERE chat_id = ?
+            """, (chat_id,)) as cursor:
+                msg_count_row = await cursor.fetchone()
+                msg_count = msg_count_row["count"] if msg_count_row else 0
+            
+            # Get first user message for name generation
+            async with db.execute("""
+                SELECT content FROM messages 
+                WHERE chat_id = ? AND sender = 'user' 
+                ORDER BY timestamp ASC LIMIT 1
+            """, (chat_id,)) as cursor:
+                first_msg_row = await cursor.fetchone()
+                first_question = first_msg_row["content"] if first_msg_row else None
+            
+            # Get chat name
+            async with db.execute("""
+                SELECT name FROM chats WHERE id = ?
+            """, (chat_id,)) as cursor:
+                chat_name_row = await cursor.fetchone()
+                current_name = chat_name_row["name"] if chat_name_row else "New Chat"
+            
+            # Generate name after first exchange (2 messages: user + assistant)
+            if msg_count == 2 and first_question and current_name == "New Chat":
+                new_name = await generate_chat_name(first_question, rag_manager)
+                await db.execute("""
+                    UPDATE chats SET name = ? WHERE id = ?
+                """, (new_name, chat_id))
+                await db.commit()
+                logger.info(f"Generated chat name: {new_name} for chat: {chat_id}")
+            
+            # Check for name update every 5 messages
+            elif msg_count > 0 and msg_count % 5 == 0:
+                # Get recent messages
+                async with db.execute("""
+                    SELECT content FROM messages 
+                    WHERE chat_id = ? 
+                    ORDER BY timestamp DESC LIMIT 5
+                """, (chat_id,)) as cursor:
+                    recent_rows = await cursor.fetchall()
+                    recent_messages = [row["content"] for row in recent_rows]
+                
+                new_name = await should_update_chat_name(chat_id, current_name, recent_messages, rag_manager)
+                if new_name:
+                    await db.execute("""
+                        UPDATE chats SET name = ? WHERE id = ?
+                    """, (new_name, chat_id))
+                    await db.commit()
+                    logger.info(f"Updated chat name: {new_name} for chat: {chat_id}")
+        
         # Create response message
         response_message = ChatSendResponse(
-            id=f"ai-{int(datetime.now().timestamp() * 1000)}-{uuid.uuid4().hex[:9]}",
+            id=ai_message_id,
             content=result,
             sender="assistant",
-            timestamp=datetime.now().isoformat()
+            timestamp=now
         )
-        
-        # Store in chat history
-        user_message = ChatMessage(
-            id=f"user-{int(datetime.now().timestamp() * 1000)}-{uuid.uuid4().hex[:9]}",
-            content=request.content,
-            sender="user",
-            timestamp=datetime.now().isoformat()
-        )
-        chat_messages.append(user_message)
-        chat_messages.append(ChatMessage(**response_message.dict()))
         
         logger.info(f"Query processed successfully: {request.content[:50]}...")
         return response_message
@@ -740,9 +1431,55 @@ async def send_chat_message(request: ChatSendRequest, current_user: str = Depend
             }
         )
 
+@app.post("/chat/send", response_model=ChatSendResponse)
+async def send_chat_message_legacy(request: ChatMessageRequest, current_user: str = Depends(get_current_user)):
+    """Legacy endpoint: Send a query and get AI response (creates default chat if needed)"""
+    # If no chat_id provided, create or get default chat
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        # Try to find a default chat for this user
+        async with db.execute("""
+            SELECT id FROM chats 
+            WHERE user_id = ? AND is_temporary = 0 
+            ORDER BY updated_at DESC LIMIT 1
+        """, (current_user,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                chat_id = row["id"]
+            else:
+                # Create new chat
+                chat_id = str(uuid.uuid4())
+                now = datetime.now().isoformat()
+                await db.execute("""
+                    INSERT INTO chats (id, user_id, name, is_temporary, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (chat_id, current_user, "New Chat", False, now, now))
+                await db.commit()
+    
+    # Forward to new endpoint
+    return await send_chat_message(chat_id, request, current_user)
+
 @app.post("/chat/clear")
-async def clear_chat(current_user: str = Depends(get_current_user)):
-    """Clear chat message history"""
+async def clear_chat_legacy(current_user: str = Depends(get_current_user)):
+    """Legacy endpoint: Clear chat message history (uses default chat)"""
+    # Find default chat for user
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id FROM chats 
+            WHERE user_id = ? AND is_temporary = 0 
+            ORDER BY updated_at DESC LIMIT 1
+        """, (current_user,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                chat_id = row["id"]
+                # Clear messages
+                await db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+                await db.commit()
+                logger.info(f"Chat history cleared by user: {current_user}")
+                return {"status": "success", "message": "Chat history cleared"}
+    
+    # Fallback: clear in-memory storage
     global chat_messages
     chat_messages.clear()
     logger.info(f"Chat history cleared by user: {current_user}")

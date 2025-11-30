@@ -10,9 +10,16 @@ interface AppConfig {
     apiBaseUrl: string
     apiEndpoints: {
         health: string
-        chatMessages: string
-        chatSend: string
-        chatClear: string
+        chatMessagesLegacy: string
+        chatSendLegacy: string
+        chatClearLegacy: string
+        chats: string
+        chat: (id: string) => string
+        chatMessages: (id: string) => string
+        chatSendMessage: (id: string) => string
+        chatUpdateName: (id: string) => string
+        chatDelete: (id: string) => string
+        chatClear: (id: string) => string
         documents: string
         deleteDocument: (id: string) => string
         upload: string
@@ -50,9 +57,16 @@ const config: AppConfig = {
 
     apiEndpoints: {
         health: '/health',
-        chatMessages: '/chat/messages',
-        chatSend: '/chat/send',
-        chatClear: '/chat/clear',
+        chatMessagesLegacy: '/chat/messages',
+        chatSendLegacy: '/chat/send',
+        chatClearLegacy: '/chat/clear',
+        chats: '/chats',
+        chat: (id: string) => `/chats/${id}`,
+        chatMessages: (id: string) => `/chats/${id}/messages`,
+        chatSendMessage: (id: string) => `/chats/${id}/messages`,
+        chatUpdateName: (id: string) => `/chats/${id}/name`,
+        chatDelete: (id: string) => `/chats/${id}`,
+        chatClear: (id: string) => `/chats/${id}/clear`,
         documents: '/documents',
         deleteDocument: (id: string) => `/documents/${id}`,
         upload: '/upload',

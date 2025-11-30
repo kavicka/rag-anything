@@ -460,42 +460,116 @@ async def process_upload_folder():
         lightrag_kwargs=lightrag_kwargs,
     )
 
-    # Process all files in the upload folder
+    # Helper function to check if error is retryable
+    def is_retryable_error(error: Exception) -> bool:
+        """Determine if an error is retryable (e.g., embedding errors, connection issues)"""
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+        
+        retryable_patterns = [
+            "embedding",
+            "eof",
+            "connection",
+            "timeout",
+            "llama runner process no longer running",
+            "500",
+            "503",
+            "502",
+            "network",
+            "socket",
+            "refused",
+        ]
+        
+        retryable_types = [
+            "ConnectionError",
+            "TimeoutError",
+            "OSError",
+            "IOError",
+        ]
+        
+        if any(pattern in error_str for pattern in retryable_patterns):
+            return True
+        
+        if any(retry_type in error_type for retry_type in retryable_types):
+            return True
+        
+        return False
+
+    # Process all files in the upload folder with retry logic
     logger.info(f"\n{'='*60}")
     logger.info(f"Processing files in: {upload_folder}")
     logger.info(f"{'='*60}\n")
 
+    # Get retry configuration
+    max_retries = int(os.getenv("PROCESSING_MAX_RETRIES", "3"))
+    retry_delay_base = float(os.getenv("PROCESSING_RETRY_DELAY_BASE", "2.0"))  # Base delay in seconds
+    
+    last_error = None
+    
     try:
-        await rag.process_folder_complete(
-            folder_path=str(upload_folder),
-            output_dir=output_dir,
-            parse_method=parse_method,
-            display_stats=True,
-            recursive=True,  # Process subdirectories if any
-            max_workers=int(os.getenv("MAX_CONCURRENT_FILES", "1")),  # Process files concurrently
-        )
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"RETRY ATTEMPT {attempt + 1}/{max_retries}")
+                    logger.info(f"{'='*60}\n")
+                    # Wait before retrying with exponential backoff
+                    retry_delay = retry_delay_base * (2 ** (attempt - 1))
+                    logger.info(f"Waiting {retry_delay:.1f} seconds before retry...")
+                    await asyncio.sleep(retry_delay)
+                
+                await rag.process_folder_complete(
+                    folder_path=str(upload_folder),
+                    output_dir=output_dir,
+                    parse_method=parse_method,
+                    display_stats=True,
+                    recursive=True,  # Process subdirectories if any
+                    max_workers=int(os.getenv("MAX_CONCURRENT_FILES", "1")),  # Process files concurrently
+                )
 
-        logger.info(f"\n{'='*60}")
-        logger.info("✅ Successfully processed all files!")
-        logger.info(f"{'='*60}\n")
+                logger.info(f"\n{'='*60}")
+                logger.info("✅ Successfully processed all files!" + (f" (after {attempt} retries)" if attempt > 0 else ""))
+                logger.info(f"{'='*60}\n")
 
-        # Test query to verify processing
-        logger.info("Testing database with a sample query...")
-        test_query = "What is the main content of the documents?"
-        try:
-            result = await rag.aquery(test_query, mode="hybrid")
-            logger.info(f"Query: {test_query}")
-            logger.info(f"Answer: {result}\n")
-        except Exception as query_error:
-            logger.warning(f"Test query failed (this is okay if API is not fully configured): {str(query_error)}")
-            logger.info("Document parsing completed successfully. You can query the database later once API is configured.")
+                # Test query to verify processing
+                logger.info("Testing database with a sample query...")
+                test_query = "What is the main content of the documents?"
+                try:
+                    result = await rag.aquery(test_query, mode="hybrid")
+                    logger.info(f"Query: {test_query}")
+                    logger.info(f"Answer: {result}\n")
+                except Exception as query_error:
+                    logger.warning(f"Test query failed (this is okay if API is not fully configured): {str(query_error)}")
+                    logger.info("Document parsing completed successfully. You can query the database later once API is configured.")
 
-        return True
+                return True
 
-    except Exception as e:
-        logger.error(f"Error processing files: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+            except Exception as e:
+                last_error = e
+                error_msg = str(e)
+                logger.error(f"\n{'='*60}")
+                logger.error(f"Error processing files (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                logger.error(f"{'='*60}")
+                import traceback
+                logger.error(traceback.format_exc())
+                
+                # Check if error is retryable
+                is_retryable = is_retryable_error(e)
+                is_last_attempt = (attempt + 1) >= max_retries
+                
+                if is_retryable and not is_last_attempt:
+                    logger.warning(f"Retryable error detected. Will retry processing from the beginning...")
+                    continue  # Retry
+                else:
+                    # Non-retryable error or last attempt - fail permanently
+                    logger.error(f"\n{'='*60}")
+                    logger.error("❌ Processing failed permanently after all retry attempts")
+                    logger.error(f"{'='*60}\n")
+                    return False
+        
+        # Should not reach here, but just in case
+        if last_error:
+            logger.error(f"Processing failed after {max_retries} attempts: {str(last_error)}")
         return False
     finally:
         # Finalize storages before event loop closes to avoid warnings

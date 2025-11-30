@@ -75,27 +75,97 @@ def encode_image_to_base64(image_path: str) -> str:
         return ""
 
 
-def validate_image_file(image_path: str, max_size_mb: int = 50) -> bool:
+def resolve_image_path(image_path: str, output_dir: str = None) -> str:
+    """
+    Resolve image path, trying multiple strategies if the original path doesn't exist
+    
+    Args:
+        image_path: Original image path (can be absolute or relative)
+        output_dir: Output directory to search in if path doesn't exist
+        
+    Returns:
+        str: Resolved image path, or original path if not found
+    """
+    try:
+        path = Path(image_path)
+        
+        # If path exists, return it
+        if path.exists():
+            return str(path.resolve())
+        
+        # If path is absolute but doesn't exist, try to find it relative to output_dir
+        if path.is_absolute() and output_dir:
+            # Extract just the filename
+            filename = path.name
+            
+            # Try to find it in common locations within output_dir
+            # Pattern: output_dir/{uuid}/auto/images/filename or output_dir/{uuid}/images/filename
+            output_dir_path = Path(output_dir)
+            if output_dir_path.exists():
+                # First, try searching in subdirectories that match the pattern
+                # Look for images directories in any subdirectory
+                for subdir in output_dir_path.iterdir():
+                    if subdir.is_dir():
+                        # Try auto/images/ first (most common structure)
+                        auto_images_path = subdir / "auto" / "images" / filename
+                        if auto_images_path.exists():
+                            logger.info(f"Resolved image path: {image_path} -> {auto_images_path}")
+                            return str(auto_images_path.resolve())
+                        
+                        # Try images/ directly
+                        images_path = subdir / "images" / filename
+                        if images_path.exists():
+                            logger.info(f"Resolved image path: {image_path} -> {images_path}")
+                            return str(images_path.resolve())
+                
+                # Fallback: recursive search for the filename
+                for img_file in output_dir_path.rglob(filename):
+                    if img_file.is_file():
+                        logger.info(f"Resolved image path: {image_path} -> {img_file}")
+                        return str(img_file.resolve())
+        
+        # If relative path, try resolving relative to output_dir
+        if not path.is_absolute() and output_dir:
+            output_path = Path(output_dir) / image_path
+            if output_path.exists():
+                logger.info(f"Resolved relative image path: {image_path} -> {output_path}")
+                return str(output_path.resolve())
+        
+        # Return original path if we can't resolve it
+        return image_path
+        
+    except Exception as e:
+        logger.error(f"Error resolving image path {image_path}: {e}")
+        return image_path
+
+
+def validate_image_file(image_path: str, max_size_mb: int = 50, output_dir: str = None) -> bool:
     """
     Validate if a file is a valid image file
 
     Args:
         image_path: Path to the image file
         max_size_mb: Maximum file size in MB
+        output_dir: Optional output directory to search in if path doesn't exist
 
     Returns:
         bool: True if valid, False otherwise
     """
     try:
-        path = Path(image_path)
+        # Try to resolve the path first
+        resolved_path = resolve_image_path(image_path, output_dir)
+        path = Path(resolved_path)
 
-        logger.debug(f"Validating image path: {image_path}")
+        logger.debug(f"Validating image path: {image_path} (resolved: {resolved_path})")
         logger.debug(f"Resolved path object: {path}")
         logger.debug(f"Path exists check: {path.exists()}")
 
         # Check if file exists
         if not path.exists():
-            logger.warning(f"Image file not found: {image_path}")
+            if resolved_path != image_path:
+                logger.warning(f"Image file not found at original path: {image_path}, tried resolved path: {resolved_path}")
+            else:
+                logger.warning(f"Image file not found: {image_path}")
             return False
 
         # Check file extension

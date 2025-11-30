@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
-import { MessageCircle, Upload, Settings, Send, FileText, Trash2, CheckCircle, Clock, Play, X, Square, AlertCircle, LogOut } from 'lucide-react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { MessageCircle, Upload, Send, FileText, Trash2, CheckCircle, Clock, Play, X, Square, AlertCircle, LogOut, Plus, Edit2 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
@@ -63,6 +63,16 @@ interface ProcessingStatus {
     message: string
 }
 
+interface Chat {
+    id: string
+    user_id: string
+    name: string
+    is_temporary: boolean
+    created_at: string
+    updated_at: string
+    last_message_at: string | null
+}
+
 const App: React.FC = () => {
     const { isAuthenticated, isLoading: authLoading, token, logout, user } = useAuth()
     const [activeTab, setActiveTab] = useState<'chat' | 'documents'>('chat')
@@ -77,7 +87,6 @@ const App: React.FC = () => {
     const inputValueRef = useRef('')
     const fileInputRef = useRef<HTMLInputElement>(null)
     const uploadedFilesContainerRef = useRef<HTMLDivElement>(null)
-    const savedScrollPositionRef = useRef<number>(0)
 
     // New state for file upload system
     const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
@@ -87,6 +96,11 @@ const App: React.FC = () => {
     // Backend readiness state
     const [isBackendReady, setIsBackendReady] = useState(false)
     const [backendStatus, setBackendStatus] = useState('Kontroluji stav AI systému...')
+
+    // Chat management state
+    const [chats, setChats] = useState<Chat[]>([])
+    const [currentChatId, setCurrentChatId] = useState<string | null>(null)
+    const [isTemporaryMode, setIsTemporaryMode] = useState(false)
 
     // Scroll to bottom function - must be before early returns (Rules of Hooks)
     const scrollToBottom = useCallback(() => {
@@ -156,16 +170,127 @@ const App: React.FC = () => {
 
     // No need to poll processing statuses since files are processed immediately
 
-    const loadMessages = async () => {
+    const loadChats = async () => {
         try {
-            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chatMessages), { method: 'GET' }, token)
+            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chats), { method: 'GET' }, token)
+            if (response.ok) {
+                const data = await response.json()
+                const loadedChats: Chat[] = data.chats || []
+                setChats(loadedChats)
+
+                // If no current chat selected, select the most recent one
+                if (!currentChatId && loadedChats.length > 0) {
+                    setCurrentChatId(loadedChats[0].id)
+                }
+            }
+        } catch (error) {
+            console.error('Error loading chats:', error)
+        }
+    }
+
+    const loadMessages = async (chatId: string | null) => {
+        if (!chatId) {
+            setMessages([])
+            return
+        }
+
+        try {
+            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chatMessages(chatId)), { method: 'GET' }, token)
             if (response.ok) {
                 const msgs: ChatMessage[] = await response.json()
                 setMessages(msgs)
                 // Scroll to bottom after loading messages
                 setTimeout(() => scrollToBottom(), 100)
             }
-        } catch (error) {}
+        } catch (error) {
+            console.error('Error loading messages:', error)
+        }
+    }
+
+    const createChat = async (isTemporary: boolean = false) => {
+        try {
+            const response = await fetchWithAuth(
+                buildApiUrl(config.apiEndpoints.chats),
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ is_temporary: isTemporary }),
+                },
+                token
+            )
+            if (response.ok) {
+                const newChat: Chat = await response.json()
+                // Update chats list
+                setChats((prev) => [newChat, ...prev])
+                // Set as current chat
+                setCurrentChatId(newChat.id)
+                // Clear messages - they will be loaded when currentChatId changes
+                setMessages([])
+                return newChat
+            }
+        } catch (error) {
+            console.error('Error creating chat:', error)
+        }
+        return null
+    }
+
+    const deleteChat = async (chatId: string) => {
+        // Show confirmation dialog
+        const chatToDelete = chats.find((c) => c.id === chatId)
+        const chatName = chatToDelete?.name || 'tento chat'
+        if (!window.confirm(`Opravdu chcete smazat chat "${chatName}"? Tato akce je nevratná.`)) {
+            return
+        }
+
+        try {
+            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chatDelete(chatId)), { method: 'DELETE' }, token)
+            if (response.ok) {
+                // Update chats list
+                const updatedChats = chats.filter((c) => c.id !== chatId)
+                setChats(updatedChats)
+
+                // If deleted chat was current, switch to another or clear
+                if (currentChatId === chatId) {
+                    if (updatedChats.length > 0) {
+                        setCurrentChatId(updatedChats[0].id)
+                    } else {
+                        setCurrentChatId(null)
+                        setMessages([])
+                    }
+                }
+            } else {
+                const errorData = await response.json().catch(() => ({}))
+                alert(`Chyba při mazání chatu: ${errorData.detail || 'Neznámá chyba'}`)
+            }
+        } catch (error) {
+            console.error('Error deleting chat:', error)
+            alert('Chyba při mazání chatu. Zkuste to prosím znovu.')
+        }
+    }
+
+    const switchChat = async (chatId: string) => {
+        setCurrentChatId(chatId)
+        await loadMessages(chatId)
+    }
+
+    const updateChatName = async (chatId: string, newName: string) => {
+        try {
+            const response = await fetchWithAuth(
+                buildApiUrl(config.apiEndpoints.chatUpdateName(chatId)),
+                {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName }),
+                },
+                token
+            )
+            if (response.ok) {
+                const updatedChat: Chat = await response.json()
+                setChats((prev) => prev.map((c) => (c.id === chatId ? updatedChat : c)))
+            }
+        } catch (error) {
+            console.error('Error updating chat name:', error)
+        }
     }
 
     const loadDocuments = async () => {
@@ -182,37 +307,37 @@ const App: React.FC = () => {
     useEffect(() => {
         if (isAuthenticated && token) {
             checkBackendReadiness()
-            loadMessages()
+            loadChats()
             loadDocuments()
         }
     }, [isAuthenticated, token])
 
-    // Preserve scroll position in uploaded files container during status updates
-    const previousUploadedFilesLengthRef = useRef<number>(0)
-
-    // Save scroll position on every render (captures it before React potentially resets it)
+    // Load messages when chat changes
     useEffect(() => {
-        if (uploadedFilesContainerRef.current) {
-            const currentScroll = uploadedFilesContainerRef.current.scrollTop
-            // Only save if the number of files hasn't changed (status update, not file add/remove)
-            if (previousUploadedFilesLengthRef.current === uploadedFiles.length && currentScroll > 0) {
-                savedScrollPositionRef.current = currentScroll
-            }
+        if (currentChatId && isAuthenticated && token) {
+            loadMessages(currentChatId)
         }
-        previousUploadedFilesLengthRef.current = uploadedFiles.length
-    })
-
-    // Restore scroll position synchronously after DOM updates (before paint)
-    useLayoutEffect(() => {
-        if (uploadedFilesContainerRef.current && savedScrollPositionRef.current > 0 && previousUploadedFilesLengthRef.current === uploadedFiles.length) {
-            // Only restore if number of files hasn't changed (status update, not file add/remove)
-            uploadedFilesContainerRef.current.scrollTop = savedScrollPositionRef.current
-        }
-    }, [uploadedFiles])
+    }, [currentChatId, isAuthenticated, token])
 
     const sendMessage = useCallback(async () => {
         const messageContent = inputValueRef.current.trim()
         if (!messageContent || isLoading || isGenerating) return
+
+        // Ensure we have a chat
+        let chatId = currentChatId
+        if (!chatId) {
+            const newChat = await createChat(isTemporaryMode)
+            if (!newChat) {
+                return
+            }
+            chatId = newChat.id
+            // Reload chats to ensure the new chat appears in the list
+            await loadChats()
+            // Ensure currentChatId is set and wait for state to update
+            setCurrentChatId(chatId)
+            // Small delay to ensure state is updated and useEffect fires
+            await new Promise((resolve) => setTimeout(resolve, 150))
+        }
 
         setIsLoading(true)
         setIsGenerating(true)
@@ -261,7 +386,7 @@ const App: React.FC = () => {
         try {
             // Call backend asynchronously
             const response = await fetchWithAuth(
-                buildApiUrl(config.apiEndpoints.chatSend),
+                buildApiUrl(config.apiEndpoints.chatSendMessage(chatId)),
                 {
                     method: 'POST',
                     headers: {
@@ -273,10 +398,11 @@ const App: React.FC = () => {
             )
 
             if (response.ok) {
-                const aiResponse = (await response.json()) as ChatMessage
+                // Reload chats to get updated names and ensure new chat is visible
+                await loadChats()
 
-                // Replace loading message with actual response
-                setMessages((prev) => prev.map((msg) => (msg.id === aiMessageId ? { ...aiResponse, id: aiMessageId, loading: false } : msg)))
+                // Reload messages from server to ensure consistency
+                await loadMessages(chatId)
 
                 // Scroll to bottom after receiving response
                 setTimeout(() => scrollToBottom(), 100)
@@ -313,7 +439,7 @@ const App: React.FC = () => {
                 inputRef.current.focus()
             }
         }
-    }, [isLoading, isGenerating, token, scrollToBottom])
+    }, [isLoading, isGenerating, token, scrollToBottom, currentChatId, isTemporaryMode, createChat, loadChats])
 
     const stopGeneration = useCallback(() => {
         if (isGenerating && currentGenerationId) {
@@ -400,12 +526,15 @@ const App: React.FC = () => {
     })
 
     const clearChat = async () => {
+        if (!currentChatId) return
         try {
-            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chatClear), { method: 'POST' }, token)
+            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chatClear(currentChatId)), { method: 'POST' }, token)
             if (response.ok) {
                 setMessages([])
             }
-        } catch (error) {}
+        } catch (error) {
+            console.error('Error clearing chat:', error)
+        }
     }
 
     const handleFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -424,35 +553,6 @@ const App: React.FC = () => {
         setShowSuccessMessage(false)
 
         let filesToProcess: File[] = []
-
-        // Define supported file types and their MIME types
-        const supportedFileTypes = {
-            'application/pdf': ['.pdf'],
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-            'text/html': ['.html', '.htm'],
-            'image/png': ['.png'],
-            'image/jpeg': ['.jpg', '.jpeg'],
-            'image/tiff': ['.tiff'],
-            'image/bmp': ['.bmp'],
-            'image/gif': ['.gif'],
-            'audio/wav': ['.wav'],
-            'audio/mpeg': ['.mp3'],
-            'text/vtt': ['.vtt'],
-            'text/plain': ['.txt'],
-            'text/markdown': ['.md'],
-        }
-
-        const getFileType = (fileName: string, mimeType: string) => {
-            const extension = fileName.split('.').pop()?.toLowerCase()
-            for (const [mime, extensions] of Object.entries(supportedFileTypes)) {
-                if (extensions.includes(`.${extension}`) || mimeType === mime) {
-                    return mime
-                }
-            }
-            return 'application/octet-stream'
-        }
 
         if (files) {
             const allFiles = Array.from(files)
@@ -988,58 +1088,117 @@ const App: React.FC = () => {
         )
     }
 
-    const ChatTab = () => (
-        <div className="flex flex-col h-full">
-            {/* Header */}
-            <div className="border-b border-gray-200 p-4 bg-white">
-                <div className="flex justify-between items-center">
-                    <h2 className="text-xl font-semibold text-gray-800">Chat</h2>
-                    <button onClick={clearChat} className="px-3 py-1 text-sm bg-red-500 text-white rounded hover:bg-red-600 transition-colors">
-                        Vymazat Chat
-                    </button>
-                </div>
-            </div>
+    const ChatTab = () => {
+        const [isEditingName, setIsEditingName] = useState(false)
+        const [editedName, setEditedName] = useState('')
+        const nameInputRef = useRef<HTMLInputElement>(null)
+        const currentChat = chats.find((c) => c.id === currentChatId)
 
-            {/* Messages */}
-            <div ref={messagesContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
-                {!isBackendReady ? (
-                    <div className="text-center text-gray-500 mt-20">
-                        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-                        <p className="text-lg font-medium">{backendStatus}</p>
-                        <p className="text-sm mt-2">Počkejte prosím, zatímco se AI systém inicializuje...</p>
-                    </div>
-                ) : messages.length === 0 ? (
-                    <div className="text-center text-gray-500 mt-20">
-                        <MessageCircle size={48} className="mx-auto mb-4 opacity-50" />
-                        <p>Zatím žádné zprávy. Začněte konverzaci!</p>
-                        <p className="text-sm mt-2">Nejprve nahrajte dokumenty (PDF, DOCX, PPTX, XLSX, HTML, obrázky, audio, TXT, MD), abyste se na ně mohli ptát.</p>
-                    </div>
-                ) : (
-                    messages.map((message) => {
-                        const parsedMessage = parseTableData(message.content)
-                        return (
-                            <div key={message.id} className={`flex ${message.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${message.sender === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
-                                    {parsedMessage.text && <FormattedMessage content={parsedMessage.text} isUser={message.sender === 'user'} />}
-                                    {message.sender === 'assistant' && parsedMessage.tables.length > 0 && <TableDisplay tables={parsedMessage.tables} />}
-                                    {message.loading && (
-                                        <div className="flex items-center mt-2">
-                                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-400"></div>
-                                            <span className="text-xs ml-2 opacity-75">Přemýšlím...</span>
-                                        </div>
-                                    )}
-                                    <p className={`text-xs mt-1 opacity-75`}>{formatTimestamp(message.timestamp)}</p>
+        const handleEditName = () => {
+            if (currentChat) {
+                setEditedName(currentChat.name)
+                setIsEditingName(true)
+                setTimeout(() => nameInputRef.current?.focus(), 0)
+            }
+        }
+
+        const handleSaveName = async () => {
+            if (currentChatId && editedName.trim()) {
+                await updateChatName(currentChatId, editedName.trim())
+                setIsEditingName(false)
+            }
+        }
+
+        const handleCancelEdit = () => {
+            setIsEditingName(false)
+            setEditedName('')
+        }
+
+        return (
+            <div className="flex flex-col h-full">
+                {/* Header */}
+                <div className="border-b border-gray-200 p-4 bg-white">
+                    <div className="flex justify-between items-center">
+                        <div className="flex-1 min-w-0">
+                            {isEditingName ? (
+                                <div className="flex items-center space-x-2">
+                                    <input
+                                        ref={nameInputRef}
+                                        type="text"
+                                        value={editedName}
+                                        onChange={(e) => setEditedName(e.target.value)}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter') handleSaveName()
+                                            if (e.key === 'Escape') handleCancelEdit()
+                                        }}
+                                        className="flex-1 px-2 py-1 border border-blue-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                        maxLength={100}
+                                    />
+                                    <button onClick={handleSaveName} className="p-1 text-green-600 hover:bg-green-50 rounded" title="Uložit">
+                                        <CheckCircle size={18} />
+                                    </button>
+                                    <button onClick={handleCancelEdit} className="p-1 text-gray-600 hover:bg-gray-50 rounded" title="Zrušit">
+                                        <X size={18} />
+                                    </button>
                                 </div>
-                            </div>
-                        )
-                    })
-                )}
-            </div>
+                            ) : (
+                                <div className="flex items-center space-x-2">
+                                    <h2 className="text-xl font-semibold text-gray-800 truncate">{currentChat?.name || 'Nový Chat'}</h2>
+                                    {currentChat && (
+                                        <>
+                                            {currentChat.is_temporary && <span className="text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded">Dočasný</span>}
+                                            <button onClick={handleEditName} className="p-1 text-gray-400 hover:text-gray-600 rounded transition-colors" title="Upravit název">
+                                                <Edit2 size={16} />
+                                            </button>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
 
-            {/* Input */}
-            <ChatInputComponent isLoading={isLoading} isGenerating={isGenerating} isBackendReady={isBackendReady} backendStatus={backendStatus} sendMessage={sendMessage} stopGeneration={stopGeneration} />
-        </div>
-    )
+                {/* Messages */}
+                <div ref={messagesContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+                    {!isBackendReady ? (
+                        <div className="text-center text-gray-500 mt-20">
+                            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                            <p className="text-lg font-medium">{backendStatus}</p>
+                            <p className="text-sm mt-2">Počkejte prosím, zatímco se AI systém inicializuje...</p>
+                        </div>
+                    ) : messages.length === 0 ? (
+                        <div className="text-center text-gray-500 mt-20">
+                            <MessageCircle size={48} className="mx-auto mb-4 opacity-50" />
+                            <p>Zatím žádné zprávy. Začněte konverzaci!</p>
+                            <p className="text-sm mt-2">Nejprve nahrajte dokumenty (PDF, DOCX, PPTX, XLSX, HTML, obrázky, audio, TXT, MD), abyste se na ně mohli ptát.</p>
+                        </div>
+                    ) : (
+                        messages.map((message) => {
+                            const parsedMessage = parseTableData(message.content)
+                            return (
+                                <div key={message.id} className={`flex ${message.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                    <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${message.sender === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-800'}`}>
+                                        {parsedMessage.text && <FormattedMessage content={parsedMessage.text} isUser={message.sender === 'user'} />}
+                                        {message.sender === 'assistant' && parsedMessage.tables.length > 0 && <TableDisplay tables={parsedMessage.tables} />}
+                                        {message.loading && (
+                                            <div className="flex items-center mt-2">
+                                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-400"></div>
+                                                <span className="text-xs ml-2 opacity-75">Přemýšlím...</span>
+                                            </div>
+                                        )}
+                                        <p className={`text-xs mt-1 opacity-75`}>{formatTimestamp(message.timestamp)}</p>
+                                    </div>
+                                </div>
+                            )
+                        })
+                    )}
+                </div>
+
+                {/* Input */}
+                <ChatInputComponent isLoading={isLoading} isGenerating={isGenerating} isBackendReady={isBackendReady} backendStatus={backendStatus} sendMessage={sendMessage} stopGeneration={stopGeneration} />
+            </div>
+        )
+    }
 
     const DocumentsTab = () => (
         <div className="flex flex-col h-full overflow-hidden">
@@ -1120,7 +1279,7 @@ const App: React.FC = () => {
                         </div>
 
                         {/* File Cards */}
-                        <div ref={uploadedFilesContainerRef} className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar">
+                        <div ref={uploadedFilesContainerRef} className="space-y-3">
                             {uploadedFiles.map((uploadedFile) => (
                                 <div key={uploadedFile.id} className="border border-gray-200 rounded-lg p-4 bg-white shadow-sm">
                                     <div className="flex items-start justify-between">
@@ -1261,7 +1420,7 @@ const App: React.FC = () => {
                 <div className="p-4 border-t border-slate-700 space-y-2">
                     {user && (
                         <div className="px-3 py-2 text-sm text-slate-300">
-                            Přihlášen jako: <span className="font-medium text-white">{user.username}</span>
+                            Přihlášen jako: <span className="font-medium text-white">{user?.username || ''}</span>
                         </div>
                     )}
                     <button onClick={logout} className="w-full flex items-center space-x-3 px-3 py-2 rounded-lg hover:bg-red-600 transition-colors text-red-200 hover:text-white">
@@ -1270,6 +1429,71 @@ const App: React.FC = () => {
                     </button>
                 </div>
             </div>
+
+            {/* Chat Sidebar - only show on chat tab */}
+            {activeTab === 'chat' && (
+                <div className="w-64 bg-gray-50 border-r border-gray-200 flex flex-col">
+                    <div className="p-4 border-b border-gray-200 bg-white">
+                        <div className="flex items-center justify-between mb-3">
+                            <h2 className="text-lg font-semibold text-gray-800">Chaty</h2>
+                            <div className="flex space-x-1">
+                                <button onClick={() => createChat(false)} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title="Nový chat">
+                                    <Plus size={18} />
+                                </button>
+                            </div>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                            <label className="flex items-center space-x-2 text-sm text-gray-600 cursor-pointer">
+                                <input type="checkbox" checked={isTemporaryMode} onChange={(e) => setIsTemporaryMode(e.target.checked)} className="rounded" />
+                                <span>Dočasný chat</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                        {chats.length === 0 ? (
+                            <div className="text-center text-gray-500 mt-8 p-4">
+                                <MessageCircle size={32} className="mx-auto mb-2 opacity-50" />
+                                <p className="text-sm">Žádné chaty</p>
+                                <p className="text-xs mt-1">Vytvořte nový chat</p>
+                            </div>
+                        ) : (
+                            chats.map((chat) => (
+                                <div key={chat.id} onClick={() => switchChat(chat.id)} className={`group p-3 rounded-lg cursor-pointer transition-colors ${currentChatId === chat.id ? 'bg-blue-100 border border-blue-300' : 'bg-white border border-gray-200 hover:bg-gray-50'}`}>
+                                    <div className="flex items-start justify-between">
+                                        <div className="flex-1 min-w-0">
+                                            <div className="flex items-center space-x-2">
+                                                <p className={`text-sm font-medium truncate ${currentChatId === chat.id ? 'text-blue-800' : 'text-gray-800'}`}>{chat.name}</p>
+                                                {chat.is_temporary && <span className="text-xs text-gray-500 bg-gray-200 px-1.5 py-0.5 rounded">Dočasný</span>}
+                                            </div>
+                                            {chat.last_message_at && (
+                                                <p className="text-xs text-gray-500 mt-1">
+                                                    {new Date(chat.last_message_at).toLocaleDateString('cs-CZ', {
+                                                        day: '2-digit',
+                                                        month: '2-digit',
+                                                        hour: '2-digit',
+                                                        minute: '2-digit',
+                                                    })}
+                                                </p>
+                                            )}
+                                        </div>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation()
+                                                deleteChat(chat.id)
+                                            }}
+                                            className="ml-2 p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                            title="Smazat chat"
+                                        >
+                                            <Trash2 size={14} />
+                                        </button>
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                    </div>
+                </div>
+            )}
 
             {/* Main Content */}
             <div className="flex-1 flex flex-col">{activeTab === 'chat' ? <ChatTab /> : <DocumentsTab />}</div>

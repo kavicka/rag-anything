@@ -1473,9 +1473,10 @@ class ProcessorMixin:
             )
 
         # Step 3: Insert pure text content with all parameters
+        if file_name is None:
+            file_name = os.path.basename(file_path)
+        
         if text_content.strip():
-            if file_name is None:
-                file_name = os.path.basename(file_path)
             await insert_text_content(
                 self.lightrag,
                 input=text_content,
@@ -1484,6 +1485,35 @@ class ProcessorMixin:
                 split_by_character_only=split_by_character_only,
                 ids=doc_id,
             )
+        else:
+            # If no text content, ensure document status is still created
+            # This handles cases where documents only have images/tables/equations
+            self.logger.info(f"No text content found for document {doc_id}, ensuring document status is created")
+            try:
+                # Check if document status exists
+                current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+                if not current_doc_status:
+                    # Create initial document status
+                    await self.lightrag.doc_status.upsert(
+                        {
+                            doc_id: {
+                                "status": DocStatus.PROCESSING,
+                                "content": "",
+                                "error_msg": "",
+                                "content_summary": "",
+                                "multimodal_content": [],
+                                "content_length": 0,
+                                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                                "file_path": file_name,
+                                "chunks_count": 0,
+                                "chunks_list": [],
+                            }
+                        }
+                    )
+                    self.logger.info(f"Created document status for {doc_id} with no text content")
+            except Exception as e:
+                self.logger.warning(f"Error ensuring document status for {doc_id}: {e}")
 
         # Step 4: Process multimodal content (using specialized processors)
         if multimodal_items:
@@ -1495,6 +1525,55 @@ class ProcessorMixin:
             self.logger.debug(
                 f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
             )
+
+        # Step 5: Verify document status was saved and update if needed
+        try:
+            doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            if doc_status:
+                # Ensure status is set to PROCESSED if not already
+                if doc_status.get("status") != DocStatus.PROCESSED:
+                    # Get chunks count if available
+                    chunks_count = doc_status.get("chunks_count", 0)
+                    chunks_list = doc_status.get("chunks_list", [])
+                    
+                    # Update status to PROCESSED
+                    await self.lightrag.doc_status.upsert(
+                        {
+                            doc_id: {
+                                **doc_status,
+                                "status": DocStatus.PROCESSED,
+                                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                                "file_path": file_name,
+                                "chunks_count": chunks_count,
+                                "chunks_list": chunks_list,
+                            }
+                        }
+                    )
+                    self.logger.info(f"Updated document status to PROCESSED for {doc_id}")
+            else:
+                # Document status doesn't exist, create it
+                self.logger.warning(f"Document status not found for {doc_id}, creating it")
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_id: {
+                            "status": DocStatus.PROCESSED,
+                            "content": text_content[:100] if text_content else "",
+                            "error_msg": "",
+                            "content_summary": text_content[:50] if text_content else "",
+                            "multimodal_content": [],
+                            "content_length": len(text_content) if text_content else 0,
+                            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                            "file_path": file_name,
+                            "chunks_count": 0,
+                            "chunks_list": [],
+                            "multimodal_processed": len(multimodal_items) == 0 if multimodal_items is not None else True,
+                        }
+                    }
+                )
+                self.logger.info(f"Created missing document status for {doc_id}")
+        except Exception as e:
+            self.logger.error(f"Error verifying/updating document status for {doc_id}: {e}")
 
         self.logger.info(f"Document {file_path} processing complete!")
 
