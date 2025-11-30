@@ -267,6 +267,9 @@ class ChatNameUpdateRequest(BaseModel):
 class ChatMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=10000)
     chat_id: Optional[str] = None
+    query_mode: Optional[str] = Field(default="auto", description="Query mode: 'all', 'selected', or 'auto'")
+    document_names: Optional[List[str]] = Field(default=None, description="List of document names to query (for 'selected' mode)")
+    filter_metadata: Optional[Dict[str, Any]] = Field(default=None, description="Metadata filters (e.g., {'file_type': 'pdf'})")
 
 # ============================================================================
 # RAG Manager (Singleton)
@@ -471,9 +474,8 @@ class RAGManager:
         # Look for patterns like "document X and document Y" or file names
         document_names = []
         
+        # Pattern 1: "compare X and Y" (only if comparison keywords found)
         if is_multi_doc:
-            # Try to extract document names using common patterns
-            # Pattern 1: "compare X and Y"
             compare_match = re.search(r"compare\s+(.+?)\s+(?:and|vs|versus)\s+(.+)", query_lower)
             if compare_match:
                 doc1 = compare_match.group(1).strip()
@@ -486,26 +488,55 @@ class RAGManager:
                     document_names.append(doc1)
                 if doc2:
                     document_names.append(doc2)
-            
-            # Pattern 2: Look for file names (common patterns)
-            # This is a simple heuristic - can be enhanced
-            file_patterns = [
-                r"([A-Za-z0-9_\-]+\.pdf)",
-                r"([A-Za-z0-9_\-]+\.docx?)",
-                r"([A-Z][a-z]+_[A-Z][a-z]+)",  # Pattern like "Housing_Concrete"
-            ]
-            
-            for pattern in file_patterns:
-                matches = re.findall(pattern, query_text)
-                document_names.extend(matches)
+        
+        # Pattern 2: Look for file names (always extract, not just for comparison queries)
+        # This works for queries like "what is X in DocumentA and DocumentB"
+        file_patterns = [
+            r"([A-Za-z0-9_\-]+\.pdf)",
+            r"([A-Za-z0-9_\-]+\.docx?)",
+            r"([A-Z][a-z]+_[A-Z][a-z]+)",  # Pattern like "Housing_Concrete", "Office_Timber"
+            r"([A-Z][a-zA-Z0-9_]+)",  # Pattern for capitalized names like "Office_Timber", "Housing_Concrete"
+        ]
+        
+        for pattern in file_patterns:
+            matches = re.findall(pattern, query_text)
+            document_names.extend(matches)
+        
+        # Pattern 3: Look for "in X and in Y" or "in X and Y" patterns
+        # This catches queries like "what is X in Office_Timber and in Housing_Concrete"
+        in_pattern = re.findall(r"in\s+([A-Z][a-zA-Z0-9_]+)", query_text)
+        if in_pattern:
+            document_names.extend(in_pattern)
         
         # Remove duplicates and empty strings
         document_names = list(set([name for name in document_names if name]))
         
+        # If we found 2+ document names, it's a multi-document query
+        if len(document_names) >= 2:
+            is_multi_doc = True
+        
         return is_multi_doc, document_names
 
-    async def query(self, query_text: str, mode: str = "hybrid", timeout: int = 300, document_names: List[str] = None) -> str:
-        """Execute a query against the RAG system"""
+    async def query(
+        self, 
+        query_text: str, 
+        mode: str = "hybrid", 
+        timeout: int = 300, 
+        document_names: List[str] = None,
+        query_mode: str = "auto",
+        filter_metadata: Dict[str, Any] = None
+    ) -> str:
+        """
+        Execute a query against the RAG system
+        
+        Args:
+            query_text: The query text
+            mode: Retrieval mode ("hybrid", "local", "global")
+            timeout: Query timeout in seconds
+            document_names: Optional list of document names to query
+            query_mode: Query mode - "all" (all documents), "selected" (specified documents), "auto" (detect or use all)
+            filter_metadata: Optional metadata filters (e.g., {"file_type": "pdf"})
+        """
         if not self.is_ready():
             raise RuntimeError("RAG system is not initialized")
         
@@ -515,27 +546,74 @@ class RAGManager:
 
 Odpovídej stručně a pouze na to, na co se uživatel ptá. Neuváděj žádné dodatečné informace, které uživatel nepožádal."""
             
-            # Detect multi-document query if document_names not provided
-            if document_names is None:
-                is_multi_doc, detected_doc_names = self._detect_multi_document_query(query_text)
-                if is_multi_doc and len(detected_doc_names) >= 2:
-                    document_names = detected_doc_names
-                    logger.info(f"Detected multi-document query with documents: {document_names}")
+            # Determine query mode and document selection
+            if query_mode == "auto":
+                # Auto-detect: try to detect multi-document query if document_names not provided
+                if document_names is None:
+                    is_multi_doc, detected_doc_names = self._detect_multi_document_query(query_text)
+                    logger.info(f"Document detection: is_multi_doc={is_multi_doc}, detected_names={detected_doc_names}")
+                    if is_multi_doc and len(detected_doc_names) >= 2:
+                        document_names = detected_doc_names
+                        query_mode = "selected"
+                        logger.info(f"Auto-detected multi-document query with documents: {document_names}")
+                    else:
+                        # Use all documents if no specific documents detected
+                        query_mode = "all"
+                        logger.info("Auto-mode: No specific documents detected, querying all documents")
             
-            # Use multi-document query if we have 2+ document names
-            if document_names and len(document_names) >= 2:
-                logger.info(f"Using multi-document comparison for: {document_names}")
+            # Execute query based on mode
+            if query_mode == "all" or (query_mode == "auto" and not document_names):
+                # Query all documents
+                logger.info(f"Querying all documents (mode: {query_mode})")
                 result = await asyncio.wait_for(
-                    self._rag.aquery_multi_document(
+                    self._rag.aquery_all_documents(
                         query_text,
-                        document_names=document_names,
                         mode=mode,
                         system_prompt=czech_system_prompt,
+                        filter_metadata=filter_metadata,
                     ),
                     timeout=timeout
                 )
+            elif query_mode == "selected" or (query_mode == "auto" and document_names):
+                # Query selected documents or use multi-document query
+                if document_names and len(document_names) >= 2:
+                    logger.info(f"Using multi-document query for: {document_names}")
+                    # Map document names to IDs first to verify they exist
+                    doc_name_to_id = await self._rag._map_document_names_to_ids(document_names)
+                    if not doc_name_to_id or len(doc_name_to_id) < 2:
+                        logger.warning(f"Could not find all documents. Found: {list(doc_name_to_id.keys()) if doc_name_to_id else []}")
+                        logger.info("Falling back to querying all documents")
+                        result = await asyncio.wait_for(
+                            self._rag.aquery_all_documents(
+                                query_text,
+                                mode=mode,
+                                system_prompt=czech_system_prompt,
+                                filter_metadata=filter_metadata,
+                            ),
+                            timeout=timeout
+                        )
+                    else:
+                        logger.info(f"Successfully mapped documents: {list(doc_name_to_id.keys())}")
+                        result = await asyncio.wait_for(
+                            self._rag.aquery_multi_document(
+                                query_text,
+                                document_names=document_names,
+                                mode=mode,
+                                query_mode="selected",
+                                system_prompt=czech_system_prompt,
+                                filter_metadata=filter_metadata,
+                            ),
+                            timeout=timeout
+                        )
+                else:
+                    # Single document query (backwards compatible)
+                    logger.info("Using single document query")
+                    result = await asyncio.wait_for(
+                        self._rag.aquery(query_text, mode=mode, system_prompt=czech_system_prompt),
+                        timeout=timeout
+                    )
             else:
-                # Single document query (backwards compatible)
+                # Fallback to standard query
                 result = await asyncio.wait_for(
                     self._rag.aquery(query_text, mode=mode, system_prompt=czech_system_prompt),
                     timeout=timeout
@@ -861,6 +939,9 @@ Return only the new title or "NO_CHANGE", nothing else."""
 # In-memory chat message storage (deprecated - using database now)
 chat_messages: List[ChatMessage] = []
 
+# In-memory storage for temporary chats (chat_id -> user_id mapping)
+temporary_chats: Dict[str, str] = {}
+
 # Upload processing status tracking
 class ProcessingStep(str, Enum):
     UPLOAD = "upload"
@@ -1072,14 +1153,20 @@ async def create_chat(request: ChatCreateRequest, current_user: str = Depends(ge
     now = datetime.now().isoformat()
     name = request.name or "New Chat"
     
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-            INSERT INTO chats (id, user_id, name, is_temporary, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (chat_id, current_user, name, request.is_temporary, now, now))
-        await db.commit()
+    # Only save to database if not temporary
+    if not request.is_temporary:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("""
+                INSERT INTO chats (id, user_id, name, is_temporary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (chat_id, current_user, name, request.is_temporary, now, now))
+            await db.commit()
+    else:
+        # Store temporary chat in memory
+        temporary_chats[chat_id] = current_user
+        logger.info(f"Temporary chat created (in-memory): {chat_id} for user: {current_user}")
     
-    logger.info(f"Chat created: {chat_id} for user: {current_user}")
+    logger.info(f"Chat created: {chat_id} for user: {current_user} (temporary: {request.is_temporary})")
     return Chat(
         id=chat_id,
         user_id=current_user,
@@ -1092,13 +1179,13 @@ async def create_chat(request: ChatCreateRequest, current_user: str = Depends(ge
 
 @app.get("/chats", response_model=ChatListResponse)
 async def list_chats(current_user: str = Depends(get_current_user)):
-    """List all chats for current user"""
+    """List all chats for current user (only non-temporary chats from database)"""
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
             SELECT id, user_id, name, is_temporary, created_at, updated_at, last_message_at
             FROM chats
-            WHERE user_id = ?
+            WHERE user_id = ? AND is_temporary = 0
             ORDER BY updated_at DESC
         """, (current_user,)) as cursor:
             rows = await cursor.fetchall()
@@ -1120,6 +1207,26 @@ async def list_chats(current_user: str = Depends(get_current_user)):
 @app.get("/chats/{chat_id}", response_model=Chat)
 async def get_chat(chat_id: str, current_user: str = Depends(get_current_user)):
     """Get chat details"""
+    # Check if it's a temporary chat
+    if chat_id in temporary_chats:
+        if temporary_chats[chat_id] != current_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Chat not found"
+            )
+        # Return temporary chat info (not from database)
+        now = datetime.now().isoformat()
+        return Chat(
+            id=chat_id,
+            user_id=current_user,
+            name="Temporary Chat",
+            is_temporary=True,
+            created_at=now,
+            updated_at=now,
+            last_message_at=None
+        )
+    
+    # Get chat from database
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
@@ -1146,7 +1253,17 @@ async def get_chat(chat_id: str, current_user: str = Depends(get_current_user)):
 @app.get("/chats/{chat_id}/messages", response_model=List[ChatMessage])
 async def get_chat_messages(chat_id: str, current_user: str = Depends(get_current_user)):
     """Get messages for a specific chat"""
-    # Verify chat belongs to user
+    # Check if it's a temporary chat
+    if chat_id in temporary_chats:
+        if temporary_chats[chat_id] != current_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Chat not found"
+            )
+        # Temporary chats don't have messages in database, return empty list
+        return []
+    
+    # Verify chat belongs to user and get messages from database
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
@@ -1187,6 +1304,18 @@ async def update_chat_name(
     current_user: str = Depends(get_current_user)
 ):
     """Manually update chat name"""
+    # Temporary chats don't support name updates (not stored in database)
+    if chat_id in temporary_chats:
+        if temporary_chats[chat_id] != current_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Chat not found"
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot update name for temporary chats"
+        )
+    
     now = datetime.now().isoformat()
     
     async with aiosqlite.connect(DB_FILE) as db:
@@ -1230,6 +1359,19 @@ async def update_chat_name(
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str, current_user: str = Depends(get_current_user)):
     """Delete a chat and all its messages"""
+    # Check if it's a temporary chat
+    if chat_id in temporary_chats:
+        if temporary_chats[chat_id] != current_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Chat not found"
+            )
+        # Remove from in-memory storage
+        del temporary_chats[chat_id]
+        logger.info(f"Temporary chat deleted: {chat_id} by user: {current_user}")
+        return {"status": "success", "message": "Chat deleted"}
+    
+    # Delete from database
     async with aiosqlite.connect(DB_FILE) as db:
         # Verify chat belongs to user
         db.row_factory = aiosqlite.Row
@@ -1252,6 +1394,16 @@ async def delete_chat(chat_id: str, current_user: str = Depends(get_current_user
 @app.post("/chats/{chat_id}/clear")
 async def clear_chat_messages(chat_id: str, current_user: str = Depends(get_current_user)):
     """Clear all messages in a chat (keep the chat)"""
+    # Temporary chats don't have messages in database, so nothing to clear
+    if chat_id in temporary_chats:
+        if temporary_chats[chat_id] != current_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Chat not found"
+            )
+        logger.info(f"Temporary chat messages cleared (no-op): {chat_id} by user: {current_user}")
+        return {"status": "success", "message": "Chat messages cleared"}
+    
     async with aiosqlite.connect(DB_FILE) as db:
         # Verify chat belongs to user
         db.row_factory = aiosqlite.Row
@@ -1299,23 +1451,46 @@ async def send_chat_message(
             }
         )
     
-    # Verify chat belongs to user
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
-            SELECT id, name FROM chats WHERE id = ? AND user_id = ?
-        """, (chat_id, current_user)) as cursor:
-            chat_row = await cursor.fetchone()
-            if not chat_row:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Chat not found"
-                )
+    # Verify chat belongs to user (check both database and temporary chats)
+    is_temporary = False
+    chat_name = None
+    
+    # First check if it's a temporary chat
+    if chat_id in temporary_chats:
+        if temporary_chats[chat_id] != current_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Chat not found"
+            )
+        is_temporary = True
+        chat_name = "Temporary Chat"
+    else:
+        # Check database
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT id, name, is_temporary FROM chats WHERE id = ? AND user_id = ?
+            """, (chat_id, current_user)) as cursor:
+                chat_row = await cursor.fetchone()
+                if not chat_row:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Chat not found"
+                    )
+                is_temporary = bool(chat_row["is_temporary"])
+                chat_name = chat_row["name"]
     
     try:
-        # Execute query
+        # Execute query with optional parameters
         query_timeout = int(os.getenv("QUERY_TIMEOUT", "300"))  # Default 5 minutes
-        result = await rag_manager.query(request.content, mode="hybrid", timeout=query_timeout)
+        result = await rag_manager.query(
+            request.content, 
+            mode="hybrid", 
+            timeout=query_timeout,
+            document_names=request.document_names,
+            query_mode=request.query_mode or "auto",
+            filter_metadata=request.filter_metadata
+        )
         
         now = datetime.now().isoformat()
         
@@ -1323,82 +1498,85 @@ async def send_chat_message(
         user_message_id = f"user-{int(datetime.now().timestamp() * 1000)}-{uuid.uuid4().hex[:9]}"
         ai_message_id = f"ai-{int(datetime.now().timestamp() * 1000)}-{uuid.uuid4().hex[:9]}"
         
-        # Store messages in database
-        async with aiosqlite.connect(DB_FILE) as db:
-            # Insert user message
-            await db.execute("""
-                INSERT INTO messages (id, chat_id, content, sender, timestamp, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (user_message_id, chat_id, request.content, "user", now, now))
-            
-            # Insert assistant message
-            await db.execute("""
-                INSERT INTO messages (id, chat_id, content, sender, timestamp, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (ai_message_id, chat_id, result, "assistant", now, now))
-            
-            # Update chat's last_message_at and updated_at
-            await db.execute("""
-                UPDATE chats
-                SET last_message_at = ?, updated_at = ?
-                WHERE id = ?
-            """, (now, now, chat_id))
-            
-            await db.commit()
-        
-        # Check if we need to generate/update chat name
-        async with aiosqlite.connect(DB_FILE) as db:
-            db.row_factory = aiosqlite.Row
-            # Get message count
-            async with db.execute("""
-                SELECT COUNT(*) as count FROM messages WHERE chat_id = ?
-            """, (chat_id,)) as cursor:
-                msg_count_row = await cursor.fetchone()
-                msg_count = msg_count_row["count"] if msg_count_row else 0
-            
-            # Get first user message for name generation
-            async with db.execute("""
-                SELECT content FROM messages 
-                WHERE chat_id = ? AND sender = 'user' 
-                ORDER BY timestamp ASC LIMIT 1
-            """, (chat_id,)) as cursor:
-                first_msg_row = await cursor.fetchone()
-                first_question = first_msg_row["content"] if first_msg_row else None
-            
-            # Get chat name
-            async with db.execute("""
-                SELECT name FROM chats WHERE id = ?
-            """, (chat_id,)) as cursor:
-                chat_name_row = await cursor.fetchone()
-                current_name = chat_name_row["name"] if chat_name_row else "New Chat"
-            
-            # Generate name after first exchange (2 messages: user + assistant)
-            if msg_count == 2 and first_question and current_name == "New Chat":
-                new_name = await generate_chat_name(first_question, rag_manager)
+        # Only store messages in database if chat is not temporary
+        if not is_temporary:
+            async with aiosqlite.connect(DB_FILE) as db:
+                # Insert user message
                 await db.execute("""
-                    UPDATE chats SET name = ? WHERE id = ?
-                """, (new_name, chat_id))
+                    INSERT INTO messages (id, chat_id, content, sender, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (user_message_id, chat_id, request.content, "user", now, now))
+                
+                # Insert assistant message
+                await db.execute("""
+                    INSERT INTO messages (id, chat_id, content, sender, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (ai_message_id, chat_id, result, "assistant", now, now))
+                
+                # Update chat's last_message_at and updated_at
+                await db.execute("""
+                    UPDATE chats
+                    SET last_message_at = ?, updated_at = ?
+                    WHERE id = ?
+                """, (now, now, chat_id))
+                
                 await db.commit()
-                logger.info(f"Generated chat name: {new_name} for chat: {chat_id}")
             
-            # Check for name update every 5 messages
-            elif msg_count > 0 and msg_count % 5 == 0:
-                # Get recent messages
+            # Check if we need to generate/update chat name
+            async with aiosqlite.connect(DB_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                # Get message count
+                async with db.execute("""
+                    SELECT COUNT(*) as count FROM messages WHERE chat_id = ?
+                """, (chat_id,)) as cursor:
+                    msg_count_row = await cursor.fetchone()
+                    msg_count = msg_count_row["count"] if msg_count_row else 0
+                
+                # Get first user message for name generation
                 async with db.execute("""
                     SELECT content FROM messages 
-                    WHERE chat_id = ? 
-                    ORDER BY timestamp DESC LIMIT 5
+                    WHERE chat_id = ? AND sender = 'user' 
+                    ORDER BY timestamp ASC LIMIT 1
                 """, (chat_id,)) as cursor:
-                    recent_rows = await cursor.fetchall()
-                    recent_messages = [row["content"] for row in recent_rows]
+                    first_msg_row = await cursor.fetchone()
+                    first_question = first_msg_row["content"] if first_msg_row else None
                 
-                new_name = await should_update_chat_name(chat_id, current_name, recent_messages, rag_manager)
-                if new_name:
+                # Get chat name
+                async with db.execute("""
+                    SELECT name FROM chats WHERE id = ?
+                """, (chat_id,)) as cursor:
+                    chat_name_row = await cursor.fetchone()
+                    current_name = chat_name_row["name"] if chat_name_row else "New Chat"
+                
+                # Generate name after first exchange (2 messages: user + assistant)
+                if msg_count == 2 and first_question and current_name == "New Chat":
+                    new_name = await generate_chat_name(first_question, rag_manager)
                     await db.execute("""
                         UPDATE chats SET name = ? WHERE id = ?
                     """, (new_name, chat_id))
                     await db.commit()
-                    logger.info(f"Updated chat name: {new_name} for chat: {chat_id}")
+                    logger.info(f"Generated chat name: {new_name} for chat: {chat_id}")
+                
+                # Check for name update every 5 messages
+                elif msg_count > 0 and msg_count % 5 == 0:
+                    # Get recent messages
+                    async with db.execute("""
+                        SELECT content FROM messages 
+                        WHERE chat_id = ? 
+                        ORDER BY timestamp DESC LIMIT 5
+                    """, (chat_id,)) as cursor:
+                        recent_rows = await cursor.fetchall()
+                        recent_messages = [row["content"] for row in recent_rows]
+                    
+                    new_name = await should_update_chat_name(chat_id, current_name, recent_messages, rag_manager)
+                    if new_name:
+                        await db.execute("""
+                            UPDATE chats SET name = ? WHERE id = ?
+                        """, (new_name, chat_id))
+                        await db.commit()
+                        logger.info(f"Updated chat name: {new_name} for chat: {chat_id}")
+        else:
+            logger.info(f"Temporary chat message not saved to database: {chat_id}")
         
         # Create response message
         response_message = ChatSendResponse(
@@ -1486,8 +1664,20 @@ async def clear_chat_legacy(current_user: str = Depends(get_current_user)):
     return {"status": "success", "message": "Chat history cleared"}
 
 @app.get("/documents", response_model=List[Document])
-async def get_documents(current_user: str = Depends(get_current_user)):
-    """Get list of processed documents from RAG storage"""
+async def get_documents(
+    current_user: str = Depends(get_current_user),
+    file_type: Optional[str] = None,
+    status: Optional[str] = None,
+    sort_by: Optional[str] = "name"
+):
+    """
+    Get list of processed documents from RAG storage with optional filtering
+    
+    Args:
+        file_type: Filter by file type (e.g., "pdf", "docx")
+        status: Filter by status (e.g., "PROCESSED")
+        sort_by: Sort field ("name", "date", "size")
+    """
     rag_manager = RAGManager()
     
     if not rag_manager.is_ready():
@@ -1500,82 +1690,43 @@ async def get_documents(current_user: str = Depends(get_current_user)):
         )
     
     try:
-        documents = []
         rag = rag_manager._rag
         
-        # Try to get documents from doc_status storage
-        if rag and rag.lightrag and rag.lightrag.doc_status:
-            try:
-                # Access the underlying storage to get all document IDs
-                # LightRAG uses KV storage for doc_status
-                # We need to get all keys from the doc_status storage
-                doc_status_storage = rag.lightrag.doc_status
-                
-                # Try to get all document IDs from storage
-                # This depends on the storage implementation
-                if hasattr(doc_status_storage, 'get_all_ids'):
-                    doc_ids = await doc_status_storage.get_all_ids()
-                elif hasattr(doc_status_storage, 'list_all'):
-                    doc_ids = await doc_status_storage.list_all()
-                else:
-                    # Fallback: try to access the underlying storage
-                    # For file-based storage, we can scan the directory
-                    working_dir = Path(rag.config.working_dir)
-                    doc_status_file = working_dir / "kv_store_doc_status.json"
-                    
-                    if doc_status_file.exists():
-                        with open(doc_status_file, 'r') as f:
-                            doc_status_data = json.load(f)
-                            doc_ids = list(doc_status_data.keys()) if isinstance(doc_status_data, dict) else []
-                    else:
-                        doc_ids = []
-                
-                # Get document details for each ID
-                for doc_id in doc_ids:
-                    try:
-                        doc_status = await doc_status_storage.get_by_id(doc_id)
-                        if doc_status:
-                            # Extract document information
-                            file_path = doc_status.get("file_path", "")
-                            file_name = Path(file_path).name if file_path else doc_id
-                            upload_time = doc_status.get("created_at", doc_status.get("updated_at", datetime.now().isoformat()))
-                            processed = doc_status.get("status") == "processed"
-                            
-                            # Try to get file size if file exists
-                            file_size = 0
-                            if file_path and Path(file_path).exists():
-                                file_size = Path(file_path).stat().st_size
-                            
-                            documents.append(Document(
-                                id=doc_id,
-                                name=file_name,
-                                path=file_path,
-                                size=file_size,
-                                upload_time=upload_time,
-                                processed=processed
-                            ))
-                    except Exception as e:
-                        logger.warning(f"Error getting document {doc_id}: {str(e)}")
-                        continue
-                        
-            except Exception as e:
-                logger.warning(f"Error accessing doc_status storage: {str(e)}")
-                # Fallback: scan output directory if available
-                output_dir = Path(os.getenv("OUTPUT_DIR", "./output"))
-                if output_dir.exists():
-                    for doc_dir in output_dir.iterdir():
-                        if doc_dir.is_dir():
-                            # Look for markdown or other processed files
-                            md_files = list(doc_dir.glob("**/*.md"))
-                            if md_files:
-                                documents.append(Document(
-                                    id=doc_dir.name,
-                                    name=doc_dir.name,
-                                    path=str(doc_dir),
-                                    size=sum(f.stat().st_size for f in md_files),
-                                    upload_time=datetime.fromtimestamp(doc_dir.stat().st_mtime).isoformat(),
-                                    processed=True
-                                ))
+        # Build filter metadata
+        filter_metadata = {}
+        if file_type:
+            filter_metadata["file_type"] = file_type
+        if status:
+            filter_metadata["status"] = status
+        
+        # Use the new get_all_documents method
+        doc_list = await rag.get_all_documents(
+            filter_metadata=filter_metadata if filter_metadata else None,
+            sort_by=sort_by or "name"
+        )
+        
+        # Convert to Document model format
+        documents = []
+        for doc_info in doc_list:
+            file_path = doc_info.get("file_path", "")
+            file_size = 0
+            if file_path and Path(file_path).exists():
+                try:
+                    file_size = Path(file_path).stat().st_size
+                except:
+                    pass
+            
+            upload_time = doc_info.get("created_at", doc_info.get("updated_at", datetime.now().isoformat()))
+            processed = doc_info.get("status") == "PROCESSED"
+            
+            documents.append(Document(
+                id=doc_info["doc_id"],
+                name=doc_info["name"],
+                path=file_path,
+                size=file_size,
+                upload_time=upload_time,
+                processed=processed
+            ))
         
         return documents
         

@@ -784,17 +784,111 @@ class QueryMixin:
             self.aquery_with_multimodal(query, multimodal_content, mode=mode, **kwargs)
         )
 
+    async def get_all_documents(
+        self, 
+        filter_metadata: Dict[str, Any] = None,
+        sort_by: str = "name"
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all processed documents with metadata
+        
+        Args:
+            filter_metadata: Optional metadata filters (e.g., {"file_type": "pdf", "status": "PROCESSED"})
+            sort_by: Sort field ("name", "date", "size")
+            
+        Returns:
+            List of document dictionaries with metadata
+        """
+        documents = []
+        
+        try:
+            if not hasattr(self.lightrag, "doc_status") or not self.lightrag.doc_status:
+                self.logger.warning("doc_status storage not available")
+                return []
+
+            # Get all document IDs
+            all_doc_ids = []
+            if hasattr(self.lightrag.doc_status, "get_all_ids"):
+                all_doc_ids = await self.lightrag.doc_status.get_all_ids()
+            elif hasattr(self.lightrag.doc_status, "list_all"):
+                all_doc_ids = await self.lightrag.doc_status.list_all()
+            else:
+                # Fallback: try to access underlying storage
+                import json
+                from pathlib import Path
+                working_dir = Path(self.config.working_dir)
+                doc_status_file = working_dir / "kv_store_doc_status.json"
+                
+                if doc_status_file.exists():
+                    with open(doc_status_file, 'r') as f:
+                        doc_status_data = json.load(f)
+                        all_doc_ids = list(doc_status_data.keys()) if isinstance(doc_status_data, dict) else []
+
+            # Get document details
+            for doc_id in all_doc_ids:
+                try:
+                    doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+                    if not doc_status:
+                        continue
+                    
+                    file_path = doc_status.get("file_path", "")
+                    file_name = Path(file_path).name if file_path else doc_id
+                    file_ext = Path(file_path).suffix.lower() if file_path else ""
+                    
+                    doc_info = {
+                        "doc_id": doc_id,
+                        "name": file_name,
+                        "file_path": file_path,
+                        "file_type": file_ext.lstrip('.') if file_ext else "unknown",
+                        "status": doc_status.get("status", "UNKNOWN"),
+                        "chunks_count": doc_status.get("chunks_count", 0),
+                        "created_at": doc_status.get("created_at", ""),
+                        "updated_at": doc_status.get("updated_at", ""),
+                        "multimodal_processed": doc_status.get("multimodal_processed", False),
+                    }
+                    
+                    # Apply metadata filters
+                    if filter_metadata:
+                        match = True
+                        for key, value in filter_metadata.items():
+                            if key not in doc_info or doc_info[key] != value:
+                                match = False
+                                break
+                        if not match:
+                            continue
+                    
+                    documents.append(doc_info)
+                    
+                except Exception as e:
+                    self.logger.debug(f"Error getting document info for {doc_id}: {e}")
+                    continue
+
+            # Sort documents
+            if sort_by == "name":
+                documents.sort(key=lambda x: x.get("name", "").lower())
+            elif sort_by == "date":
+                documents.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+            elif sort_by == "size":
+                documents.sort(key=lambda x: x.get("chunks_count", 0), reverse=True)
+
+        except Exception as e:
+            self.logger.error(f"Error getting all documents: {e}")
+        
+        return documents
+
     async def _map_document_names_to_ids(
-        self, document_names: List[str]
-    ) -> Dict[str, str]:
+        self, document_names: List[str], return_metadata: bool = False
+    ) -> Dict[str, Any]:
         """
         Map document names to document IDs by checking doc_status storage
+        Enhanced with fuzzy matching and better partial name support
 
         Args:
             document_names: List of document names (file names or partial matches)
+            return_metadata: If True, return metadata along with IDs
 
         Returns:
-            Dict mapping document names to document IDs
+            Dict mapping document names to document IDs (or dicts with metadata if return_metadata=True)
         """
         if not document_names:
             return {}
@@ -829,32 +923,119 @@ class QueryMixin:
                         doc_status_data = json.load(f)
                         all_doc_ids = list(doc_status_data.keys()) if isinstance(doc_status_data, dict) else []
 
-            # Match document names to IDs
+            # Helper function for fuzzy matching
+            def fuzzy_match(query: str, target: str) -> float:
+                """Simple fuzzy matching score (0.0 to 1.0)"""
+                query_lower = query.lower().strip()
+                target_lower = target.lower().strip()
+                
+                # Exact match
+                if query_lower == target_lower:
+                    return 1.0
+                
+                # Substring match
+                if query_lower in target_lower:
+                    return 0.8
+                if target_lower in query_lower:
+                    return 0.7
+                
+                # Word-based matching
+                query_words = set(query_lower.split())
+                target_words = set(target_lower.split())
+                if query_words and target_words:
+                    common_words = query_words.intersection(target_words)
+                    if common_words:
+                        return len(common_words) / max(len(query_words), len(target_words))
+                
+                return 0.0
+
+            # Match document names to IDs with fuzzy matching
             for doc_name in document_names:
-                doc_name_lower = doc_name.lower()
-                matched = False
+                doc_name_lower = doc_name.lower().strip()
+                # Normalize: remove underscores, convert to lowercase for better matching
+                doc_name_normalized = doc_name_lower.replace("_", "").replace("-", "")
+                best_match = None
+                best_score = 0.0
+                best_match_info = None
                 
                 for doc_id in all_doc_ids:
                     try:
                         doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
-                        if doc_status:
-                            file_path = doc_status.get("file_path", "")
-                            file_name = Path(file_path).name if file_path else ""
+                        if not doc_status:
+                            continue
+                        
+                        file_path = doc_status.get("file_path", "")
+                        file_name = Path(file_path).name if file_path else ""
+                        file_name_no_ext = Path(file_path).stem if file_path else ""
+                        
+                        # Calculate match scores for different fields
+                        scores = []
+                        match_details = []
+                        
+                        # Match against file name (normalized)
+                        if file_name:
+                            file_name_normalized = file_name.lower().replace("_", "").replace("-", "")
+                            file_name_no_ext_normalized = file_name_no_ext.lower().replace("_", "").replace("-", "")
                             
-                            # Try exact match or partial match
-                            if (
-                                doc_name_lower in file_name.lower()
-                                or file_name.lower() in doc_name_lower
-                                or doc_name_lower in doc_id.lower()
-                            ):
-                                doc_name_to_id[doc_name] = doc_id
-                                matched = True
-                                break
+                            # Check if query name is contained in file name (strong match)
+                            if doc_name_normalized in file_name_normalized:
+                                scores.append(0.9)
+                                match_details.append(f"contains in filename")
+                            if doc_name_normalized in file_name_no_ext_normalized:
+                                scores.append(0.85)
+                                match_details.append(f"contains in filename (no ext)")
+                            
+                            # Fuzzy match
+                            scores.append(fuzzy_match(doc_name_lower, file_name.lower()))
+                            scores.append(fuzzy_match(doc_name_normalized, file_name_normalized))
+                        
+                        # Match against doc_id
+                        doc_id_normalized = doc_id.lower().replace("_", "").replace("-", "")
+                        if doc_name_normalized in doc_id_normalized:
+                            scores.append(0.8)
+                            match_details.append(f"contains in doc_id")
+                        scores.append(fuzzy_match(doc_name_lower, doc_id.lower()))
+                        
+                        # Match against file path components (check each part)
+                        if file_path:
+                            path_parts = Path(file_path).parts
+                            for part in path_parts:
+                                part_normalized = part.lower().replace("_", "").replace("-", "")
+                                if doc_name_normalized in part_normalized:
+                                    scores.append(0.7)
+                                    match_details.append(f"contains in path part: {part}")
+                                scores.append(fuzzy_match(doc_name_lower, part.lower()) * 0.5)
+                        
+                        max_score = max(scores) if scores else 0.0
+                        
+                        if max_score > best_score and max_score >= 0.2:  # Lower threshold for better matching
+                            best_score = max_score
+                            best_match_info = {
+                                "file_name": file_name,
+                                "file_path": file_path,
+                                "match_details": match_details
+                            }
+                            if return_metadata:
+                                best_match = {
+                                    "doc_id": doc_id,
+                                    "file_path": file_path,
+                                    "file_name": file_name,
+                                    "status": doc_status.get("status", ""),
+                                    "chunks_count": doc_status.get("chunks_count", 0),
+                                    "match_score": max_score,
+                                }
+                            else:
+                                best_match = doc_id
+                                
                     except Exception as e:
                         self.logger.debug(f"Error checking doc_id {doc_id}: {e}")
                         continue
                 
-                if not matched:
+                if best_match:
+                    doc_name_to_id[doc_name] = best_match
+                    match_info = f" (file: {best_match_info['file_name']})" if best_match_info else ""
+                    self.logger.info(f"Matched '{doc_name}' to document (score: {best_score:.2f}){match_info}")
+                else:
                     self.logger.warning(f"Could not find document ID for: {doc_name}")
 
         except Exception as e:
@@ -865,24 +1046,75 @@ class QueryMixin:
     async def _retrieve_chunks_with_document_filter(
         self,
         query: str,
-        allowed_doc_ids: List[str],
+        allowed_doc_ids: List[str] = None,
         top_k: int = 20,
         mode: str = "hybrid",
+        filter_metadata: Dict[str, Any] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Perform hybrid retrieval with document ID filtering
+        Perform hybrid retrieval with document ID filtering and optional metadata filtering
 
         Args:
             query: Query text
-            allowed_doc_ids: List of allowed document IDs
+            allowed_doc_ids: List of allowed document IDs (None means all documents)
             top_k: Number of chunks to retrieve
             mode: Retrieval mode ("hybrid", "local", "global")
+            filter_metadata: Optional metadata filters (e.g., {"file_type": "pdf", "status": "PROCESSED"})
 
         Returns:
             List of retrieved chunks with metadata
         """
+        # If no doc_ids specified, get all document IDs (unless metadata filter is applied)
+        if allowed_doc_ids is None:
+            if filter_metadata:
+                # Apply metadata filter to get allowed doc IDs
+                all_docs = await self.get_all_documents(filter_metadata=filter_metadata)
+                allowed_doc_ids = [doc["doc_id"] for doc in all_docs]
+            else:
+                # Get all document IDs
+                all_docs = await self.get_all_documents()
+                allowed_doc_ids = [doc["doc_id"] for doc in all_docs]
+        
         if not allowed_doc_ids:
             return []
+        
+        # Apply additional metadata filtering if specified
+        if filter_metadata and allowed_doc_ids:
+            filtered_doc_ids = []
+            for doc_id in allowed_doc_ids:
+                try:
+                    doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+                    if not doc_status:
+                        continue
+                    
+                    file_path = doc_status.get("file_path", "")
+                    file_ext = Path(file_path).suffix.lower().lstrip('.') if file_path else ""
+                    
+                    doc_info = {
+                        "file_type": file_ext or "unknown",
+                        "status": doc_status.get("status", ""),
+                    }
+                    
+                    # Check if document matches all metadata filters
+                    match = True
+                    for key, value in filter_metadata.items():
+                        if key == "file_type" and doc_info.get("file_type") != value:
+                            match = False
+                            break
+                        elif key == "status" and doc_info.get("status") != value:
+                            match = False
+                            break
+                        elif key in doc_status and doc_status[key] != value:
+                            match = False
+                            break
+                    
+                    if match:
+                        filtered_doc_ids.append(doc_id)
+                except Exception as e:
+                    self.logger.debug(f"Error checking metadata for doc_id {doc_id}: {e}")
+                    continue
+            
+            allowed_doc_ids = filtered_doc_ids
 
         try:
             # Get query embedding
@@ -1121,21 +1353,140 @@ class QueryMixin:
             self.logger.debug(traceback.format_exc())
             return []
 
+    async def aquery_all_documents(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        system_prompt: str | None = None,
+        top_k: int = 20,
+        filter_metadata: Dict[str, Any] = None,
+        **kwargs,
+    ) -> str:
+        """
+        Query across all documents without requiring explicit document names
+        
+        This function performs:
+        1. Retrieval across all documents (or filtered by metadata)
+        2. Groups results by document
+        3. Returns unified answer with source attribution
+        
+        Args:
+            query: Query text
+            mode: Retrieval mode ("hybrid", "local", "global")
+            system_prompt: Optional system prompt
+            top_k: Number of chunks to retrieve
+            filter_metadata: Optional metadata filters (e.g., {"file_type": "pdf"})
+            **kwargs: Additional query parameters
+            
+        Returns:
+            str: Query result with source attribution
+        """
+        if self.lightrag is None:
+            raise ValueError(
+                "No LightRAG instance available. Please process documents first."
+            )
+        
+        # Get all document IDs (optionally filtered by metadata)
+        all_docs = await self.get_all_documents(filter_metadata=filter_metadata)
+        if not all_docs:
+            return "No documents found matching the criteria."
+        
+        allowed_doc_ids = [doc["doc_id"] for doc in all_docs]
+        doc_id_to_name = {doc["doc_id"]: doc["name"] for doc in all_docs}
+        
+        self.logger.info(
+            f"Querying across {len(allowed_doc_ids)} documents"
+        )
+        
+        # Retrieve chunks across all documents
+        retrieved_chunks = await self._retrieve_chunks_with_document_filter(
+            query=query,
+            allowed_doc_ids=allowed_doc_ids,
+            top_k=top_k * len(allowed_doc_ids),  # Get more chunks to ensure coverage
+            mode=mode,
+            filter_metadata=filter_metadata,
+        )
+        
+        if not retrieved_chunks:
+            return "No relevant content found in the documents."
+        
+        # Group chunks by document
+        chunks_by_doc = {}
+        for chunk_item in retrieved_chunks:
+            chunk_data = chunk_item["chunk_data"]
+            doc_id = chunk_data.get("full_doc_id", "")
+            
+            if doc_id in doc_id_to_name:
+                doc_name = doc_id_to_name[doc_id]
+                if doc_name not in chunks_by_doc:
+                    chunks_by_doc[doc_name] = []
+                chunks_by_doc[doc_name].append(chunk_item)
+        
+        # Build context grouped by document with source attribution
+        context_parts = []
+        for doc_name, chunks in chunks_by_doc.items():
+            context_parts.append(f"\n\n[Document: {doc_name}]\n")
+            context_parts.append("-" * 80 + "\n")
+            
+            for chunk_item in chunks:
+                chunk_data = chunk_item["chunk_data"]
+                content = chunk_data.get("content", "")
+                score = chunk_item.get("score", 0.0)
+                if content:
+                    context_parts.append(f"{content}\n\n")
+        
+        combined_context = "".join(context_parts)
+        
+        # Build prompt with source attribution
+        query_prompt = f"""Based on the following content from multiple documents, answer the user's question accurately and concisely.
+
+User Query: {query}
+
+Content from Documents:
+{combined_context}
+
+Please provide a comprehensive answer based on the source material. For each piece of information, cite which document it comes from using the format [Document: name]. Focus on:
+1. Direct information from the documents
+2. Clear source attribution for each fact
+3. Cross-document comparisons when relevant
+4. Any contradictions or complementary information
+
+Use the actual text from the documents rather than generating summaries. Always cite your sources."""
+        
+        # Make LLM call
+        try:
+            result = await self.lightrag.llm_model_func(
+                query_prompt,
+                system_prompt=system_prompt,
+                history_messages=[],
+                **kwargs,
+            )
+            
+            self.logger.info("All-documents query completed")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in all-documents LLM call: {e}")
+            raise
+
     async def aquery_multi_document(
         self,
         query: str,
         document_names: List[str] = None,
         mode: str = "hybrid",
+        query_mode: str = "auto",
         system_prompt: str | None = None,
         top_k: int = 20,
+        filter_metadata: Dict[str, Any] = None,
         **kwargs,
     ) -> str:
         """
         Multi-document comparison query using single hybrid retrieval + single LLM call
+        Enhanced with flexible query modes: "all", "selected", "auto"
 
         This function performs:
-        1. Single hybrid retrieval across all selected documents
-        2. Filters chunks by document IDs
+        1. Single hybrid retrieval across selected/all documents
+        2. Filters chunks by document IDs or metadata
         3. Combines BM25 and embedding results
         4. Applies cross-document re-ranking
         5. Groups chunks by document
@@ -1143,10 +1494,12 @@ class QueryMixin:
 
         Args:
             query: Query text
-            document_names: List of document names to compare (if None, will try to detect from query)
+            document_names: List of document names to compare (optional, depends on query_mode)
             mode: Retrieval mode ("hybrid", "local", "global")
+            query_mode: Query mode - "all" (all documents), "selected" (specified documents), "auto" (detect or use all)
             system_prompt: Optional system prompt
             top_k: Number of chunks to retrieve per document
+            filter_metadata: Optional metadata filters (e.g., {"file_type": "pdf"})
             **kwargs: Additional query parameters
 
         Returns:
@@ -1157,34 +1510,86 @@ class QueryMixin:
                 "No LightRAG instance available. Please process documents first."
             )
 
-        # Step 1: Map document names to document IDs
-        if not document_names:
-            # Try to detect document names from query (simple heuristic)
-            # This is a basic implementation - can be enhanced
-            self.logger.info("No document names provided, attempting to detect from query")
-            # For now, return error - user should provide document names
-            raise ValueError(
-                "document_names must be provided for multi-document comparison"
-            )
-
-        doc_name_to_id = await self._map_document_names_to_ids(document_names)
+        # Determine which documents to query based on query_mode
+        doc_name_to_id = None
+        allowed_doc_ids = None
         
-        if not doc_name_to_id:
-            raise ValueError(
-                f"Could not find any documents matching: {document_names}"
+        if query_mode == "all":
+            # Query all documents
+            return await self.aquery_all_documents(
+                query=query,
+                mode=mode,
+                system_prompt=system_prompt,
+                top_k=top_k,
+                filter_metadata=filter_metadata,
+                **kwargs,
             )
+        elif query_mode == "selected":
+            # Query only specified documents
+            if not document_names:
+                raise ValueError(
+                    "document_names must be provided when query_mode is 'selected'"
+                )
+            
+            doc_name_to_id = await self._map_document_names_to_ids(document_names)
+            
+            if not doc_name_to_id:
+                raise ValueError(
+                    f"Could not find any documents matching: {document_names}"
+                )
 
-        allowed_doc_ids = list(doc_name_to_id.values())
-        self.logger.info(
-            f"Found {len(allowed_doc_ids)} documents for comparison: {list(doc_name_to_id.keys())}"
-        )
+            allowed_doc_ids = list(doc_name_to_id.values())
+            self.logger.info(
+                f"Found {len(allowed_doc_ids)} documents for comparison: {list(doc_name_to_id.keys())}"
+            )
+        elif query_mode == "auto":
+            # Auto-detect: use document_names if provided, otherwise use all
+            if document_names and len(document_names) > 0:
+                doc_name_to_id = await self._map_document_names_to_ids(document_names)
+                
+                if doc_name_to_id:
+                    allowed_doc_ids = list(doc_name_to_id.values())
+                    self.logger.info(
+                        f"Auto-mode: Found {len(allowed_doc_ids)} documents: {list(doc_name_to_id.keys())}"
+                    )
+                else:
+                    # Fallback to all documents if no matches
+                    self.logger.info("Auto-mode: No document matches found, querying all documents")
+                    return await self.aquery_all_documents(
+                        query=query,
+                        mode=mode,
+                        system_prompt=system_prompt,
+                        top_k=top_k,
+                        filter_metadata=filter_metadata,
+                        **kwargs,
+                    )
+            else:
+                # No document names provided, query all
+                self.logger.info("Auto-mode: No document names provided, querying all documents")
+                return await self.aquery_all_documents(
+                    query=query,
+                    mode=mode,
+                    system_prompt=system_prompt,
+                    top_k=top_k,
+                    filter_metadata=filter_metadata,
+                    **kwargs,
+                )
+        else:
+            raise ValueError(f"Invalid query_mode: {query_mode}. Must be 'all', 'selected', or 'auto'")
 
-        # Step 2: Single hybrid retrieval across all selected documents
+        # Get document names mapping for selected documents
+        if doc_name_to_id:
+            doc_id_to_name = {v: k for k, v in doc_name_to_id.items()}
+        else:
+            raise ValueError("Failed to determine document mapping")
+
+        # Step 2: Single hybrid retrieval across selected documents
         retrieved_chunks = await self._retrieve_chunks_with_document_filter(
             query=query,
             allowed_doc_ids=allowed_doc_ids,
             top_k=top_k * len(allowed_doc_ids),  # Get more chunks to ensure coverage
             mode=mode,
+            filter_metadata=filter_metadata,
         )
 
         if not retrieved_chunks:
@@ -1192,8 +1597,6 @@ class QueryMixin:
 
         # Step 3: Group chunks by document
         chunks_by_doc = {}
-        doc_id_to_name = {v: k for k, v in doc_name_to_id.items()}
-        
         for chunk_item in retrieved_chunks:
             chunk_data = chunk_item["chunk_data"]
             doc_id = chunk_data.get("full_doc_id", "")
@@ -1204,22 +1607,23 @@ class QueryMixin:
                     chunks_by_doc[doc_name] = []
                 chunks_by_doc[doc_name].append(chunk_item)
 
-        # Step 4: Build context grouped by document
+        # Step 4: Build context grouped by document with enhanced attribution
         context_parts = []
-        for doc_name in doc_name_to_id.keys():
+        for doc_name in doc_id_to_name.values():
             if doc_name in chunks_by_doc:
-                context_parts.append(f"\n\nDocument: {doc_name}\n")
+                context_parts.append(f"\n\n[Document: {doc_name}]\n")
                 context_parts.append("-" * 80 + "\n")
                 
                 for chunk_item in chunks_by_doc[doc_name]:
                     chunk_data = chunk_item["chunk_data"]
                     content = chunk_data.get("content", "")
+                    score = chunk_item.get("score", 0.0)
                     if content:
                         context_parts.append(f"{content}\n\n")
 
         combined_context = "".join(context_parts)
 
-        # Step 5: Build prompt for single LLM call
+        # Step 5: Build prompt for single LLM call with enhanced source attribution
         comparison_prompt = f"""Based on the following content from multiple documents, please compare and analyze them according to the user's query.
 
 User Query: {query}
@@ -1233,7 +1637,7 @@ Please provide a comprehensive comparison based on the original source text from
 3. Direct quotes and citations from the source material
 4. Any contradictions or complementary information
 
-Use the actual text from the documents rather than generating summaries. Cite which document each piece of information comes from."""
+Use the actual text from the documents rather than generating summaries. Always cite which document each piece of information comes from using the format [Document: name]."""
 
         # Step 6: Make exactly ONE LLM call
         try:
@@ -1257,8 +1661,10 @@ Use the actual text from the documents rather than generating summaries. Cite wh
         query: str,
         document_names: List[str] = None,
         mode: str = "hybrid",
+        query_mode: str = "auto",
         system_prompt: str | None = None,
         top_k: int = 20,
+        filter_metadata: Dict[str, Any] = None,
         **kwargs,
     ) -> str:
         """
@@ -1268,8 +1674,10 @@ Use the actual text from the documents rather than generating summaries. Cite wh
             query: Query text
             document_names: List of document names to compare
             mode: Retrieval mode ("hybrid", "local", "global")
+            query_mode: Query mode ("all", "selected", "auto")
             system_prompt: Optional system prompt
             top_k: Number of chunks to retrieve per document
+            filter_metadata: Optional metadata filters
             **kwargs: Additional query parameters
 
         Returns:
@@ -1278,6 +1686,36 @@ Use the actual text from the documents rather than generating summaries. Cite wh
         loop = always_get_an_event_loop()
         return loop.run_until_complete(
             self.aquery_multi_document(
-                query, document_names, mode, system_prompt, top_k, **kwargs
+                query, document_names, mode, query_mode, system_prompt, top_k, filter_metadata, **kwargs
+            )
+        )
+    
+    def query_all_documents(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        system_prompt: str | None = None,
+        top_k: int = 20,
+        filter_metadata: Dict[str, Any] = None,
+        **kwargs,
+    ) -> str:
+        """
+        Synchronous version of all-documents query
+        
+        Args:
+            query: Query text
+            mode: Retrieval mode ("hybrid", "local", "global")
+            system_prompt: Optional system prompt
+            top_k: Number of chunks to retrieve
+            filter_metadata: Optional metadata filters
+            **kwargs: Additional query parameters
+            
+        Returns:
+            str: Query result with source attribution
+        """
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(
+            self.aquery_all_documents(
+                query, mode, system_prompt, top_k, filter_metadata, **kwargs
             )
         )
