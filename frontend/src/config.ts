@@ -50,10 +50,34 @@ const getEnvNumber = (key: string, defaultValue: number): number => {
     return value ? parseInt(value, 10) : defaultValue
 }
 
+// Determine API base URL
+// In production (when served from same domain), use relative URLs (empty string)
+// In development, use the backend URL
+const getApiBaseUrl = (): string => {
+    const envUrl = getEnvVar('VITE_API_BASE_URL', '')
+
+    // If explicitly set, use it
+    if (envUrl) {
+        return envUrl
+    }
+
+    // If running in production (not localhost), use relative URLs (nginx will proxy)
+    if (typeof window !== 'undefined') {
+        const hostname = window.location.hostname
+        // If not localhost/127.0.0.1, assume production and use relative URLs
+        if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
+            return '' // Relative URL - nginx will proxy
+        }
+    }
+
+    // Default to localhost for development
+    return 'http://127.0.0.1:8000'
+}
+
 // Build configuration object
 const config: AppConfig = {
     // API Configuration
-    apiBaseUrl: getEnvVar('VITE_API_BASE_URL', 'http://127.0.0.1:8000'),
+    apiBaseUrl: getApiBaseUrl(),
 
     apiEndpoints: {
         health: '/health',

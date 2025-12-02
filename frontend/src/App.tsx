@@ -525,18 +525,6 @@ const App: React.FC = () => {
         )
     })
 
-    const clearChat = async () => {
-        if (!currentChatId) return
-        try {
-            const response = await fetchWithAuth(buildApiUrl(config.apiEndpoints.chatClear(currentChatId)), { method: 'POST' }, token)
-            if (response.ok) {
-                setMessages([])
-            }
-        } catch (error) {
-            console.error('Error clearing chat:', error)
-        }
-    }
-
     const handleFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         const files = event.target.files
         if (files && files.length > 0) {
@@ -1209,7 +1197,7 @@ const App: React.FC = () => {
             </div>
 
             {/* Upload Area */}
-            <div className="p-4 bg-gray-50">
+            <div className="p-4 bg-gray-50 flex-shrink-0 overflow-y-auto max-h-[50vh]">
                 <div
                     className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center upload-area cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-colors"
                     onDragOver={(e) => {

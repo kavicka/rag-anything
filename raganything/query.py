@@ -1119,10 +1119,54 @@ class QueryMixin:
         try:
             # Get query embedding
             query_embedding = await self.lightrag.embedding_func([query])
-            if not query_embedding or len(query_embedding) == 0:
-                self.logger.error("Failed to generate query embedding")
+            
+            # Check if embedding was generated (convert to list first to avoid numpy array boolean issues)
+            if query_embedding is None:
+                self.logger.error("Failed to generate query embedding: None returned")
                 return []
+            
+            # Convert to list immediately to avoid numpy array boolean comparison issues
+            if HAS_NUMPY and isinstance(query_embedding, (np.ndarray, list)):
+                if isinstance(query_embedding, np.ndarray):
+                    query_embedding = query_embedding.tolist()
+                # If it's a list of arrays, convert each
+                if len(query_embedding) > 0 and HAS_NUMPY and isinstance(query_embedding[0], np.ndarray):
+                    query_embedding = [arr.tolist() if isinstance(arr, np.ndarray) else arr for arr in query_embedding]
+            
+            if len(query_embedding) == 0:
+                self.logger.error("Failed to generate query embedding: Empty result")
+                return []
+            
             query_embedding = query_embedding[0]
+            
+            # Ensure it's a list (not numpy array) for all subsequent operations
+            if HAS_NUMPY and isinstance(query_embedding, np.ndarray):
+                query_embedding = query_embedding.tolist()
+            
+            # Check embedding dimension matches stored vectors
+            query_dim = len(query_embedding)
+            try:
+                # Try to get a stored vector to check dimension
+                if hasattr(self.lightrag, "chunks_vdb") and self.lightrag.chunks_vdb:
+                    # Get first chunk ID if possible
+                    if hasattr(self.lightrag.text_chunks, "get_all_ids"):
+                        chunk_ids = await self.lightrag.text_chunks.get_all_ids()
+                        if chunk_ids:
+                            # Try to get embedding for first chunk
+                            chunk_data = await self.lightrag.text_chunks.get_by_id(chunk_ids[0])
+                            if chunk_data and "embedding" in chunk_data:
+                                stored_embedding = chunk_data["embedding"]
+                                if isinstance(stored_embedding, list):
+                                    stored_dim = len(stored_embedding)
+                                    if stored_dim != query_dim:
+                                        self.logger.error(
+                                            f"CRITICAL: Embedding dimension mismatch! "
+                                            f"Query embedding: {query_dim}D, Stored vectors: {stored_dim}D. "
+                                            f"This will cause retrieval to fail. "
+                                            f"Check EMBEDDING_DIM configuration."
+                                        )
+            except Exception as e:
+                self.logger.debug(f"Could not verify embedding dimension: {e}")
 
             all_chunks = {}
             chunk_scores = {}
@@ -1136,9 +1180,16 @@ class QueryMixin:
                     # Method 1: Try search method if available
                     if hasattr(self.lightrag.chunks_vdb, "search"):
                         try:
+                            # Ensure query_embedding is a list (not numpy array) before search
+                            search_embedding = query_embedding
+                            if HAS_NUMPY and isinstance(query_embedding, np.ndarray):
+                                search_embedding = query_embedding.tolist()
+                            elif not isinstance(query_embedding, list):
+                                search_embedding = list(query_embedding)
+                            
                             # Search with larger top_k to ensure we get enough results after filtering
                             raw_results = await self.lightrag.chunks_vdb.search(
-                                query_embedding, top_k=top_k * 5
+                                search_embedding, top_k=top_k * 5
                             )
                             
                             # Filter by document ID
@@ -1171,14 +1222,34 @@ class QueryMixin:
                         # Get all chunk IDs and filter
                         all_chunk_ids = []
                         try:
+                            # Try multiple methods to get chunk IDs
                             if hasattr(self.lightrag.text_chunks, "get_all_ids"):
                                 all_chunk_ids = await self.lightrag.text_chunks.get_all_ids()
                             elif hasattr(self.lightrag.text_chunks, "list_all"):
                                 all_chunk_ids = await self.lightrag.text_chunks.list_all()
+                            elif hasattr(self.lightrag.text_chunks, "keys"):
+                                # Try keys() method if available
+                                all_chunk_ids = list(await self.lightrag.text_chunks.keys())
+                            elif hasattr(self.lightrag.text_chunks, "_data"):
+                                # Fallback: access internal data structure
+                                all_chunk_ids = list(self.lightrag.text_chunks._data.keys())
+                            
+                            # If still empty, try to get from chunks_vdb
+                            if not all_chunk_ids and hasattr(self.lightrag, "chunks_vdb"):
+                                if hasattr(self.lightrag.chunks_vdb, "get_all_ids"):
+                                    all_chunk_ids = await self.lightrag.chunks_vdb.get_all_ids()
+                                elif hasattr(self.lightrag.chunks_vdb, "_data"):
+                                    all_chunk_ids = list(self.lightrag.chunks_vdb._data.keys())
+                                    
                         except Exception as e:
                             self.logger.warning(f"Could not get chunk IDs: {e}")
+                            import traceback
+                            self.logger.debug(f"Traceback: {traceback.format_exc()}")
+                        
+                        self.logger.info(f"Found {len(all_chunk_ids)} total chunks, filtering for {len(allowed_doc_ids)} documents")
                         
                         # Filter chunks by document ID and calculate similarity
+                        processed_count = 0
                         for chunk_id in all_chunk_ids[:top_k * 20]:  # Limit for performance
                             try:
                                 chunk_data = await self.lightrag.text_chunks.get_by_id(chunk_id)
@@ -1189,9 +1260,12 @@ class QueryMixin:
                                 if doc_id not in allowed_doc_ids:
                                     continue
                                 
+                                processed_count += 1
+                                
                                 # Get chunk embedding if available
                                 chunk_content = chunk_data.get("content", "")
                                 if not chunk_content:
+                                    self.logger.debug(f"Chunk {chunk_id} has no content, skipping")
                                     continue
                                 
                                 # Calculate cosine similarity manually
@@ -1199,39 +1273,59 @@ class QueryMixin:
                                     chunk_embedding = await self.lightrag.embedding_func([chunk_content])
                                     if chunk_embedding and len(chunk_embedding) > 0:
                                         chunk_emb = chunk_embedding[0]
+                                        
+                                        # Convert to list if numpy array to avoid comparison issues
+                                        if HAS_NUMPY and isinstance(chunk_emb, np.ndarray):
+                                            chunk_emb = chunk_emb.tolist()
+                                        
                                         # Cosine similarity calculation
                                         if HAS_NUMPY:
-                                            dot_product = np.dot(query_embedding, chunk_emb)
-                                            norm_query = np.linalg.norm(query_embedding)
-                                            norm_chunk = np.linalg.norm(chunk_emb)
+                                            # Convert to numpy arrays for calculation
+                                            query_arr = np.array(query_embedding)
+                                            chunk_arr = np.array(chunk_emb)
+                                            dot_product = float(np.dot(query_arr, chunk_arr))
+                                            norm_query = float(np.linalg.norm(query_arr))
+                                            norm_chunk = float(np.linalg.norm(chunk_arr))
                                         else:
                                             # Manual calculation without numpy
                                             dot_product = sum(a * b for a, b in zip(query_embedding, chunk_emb))
                                             norm_query = math.sqrt(sum(a * a for a in query_embedding))
                                             norm_chunk = math.sqrt(sum(a * a for a in chunk_emb))
                                         
+                                        # Ensure norms are scalars (not arrays)
+                                        norm_query = float(norm_query) if not isinstance(norm_query, (int, float)) else norm_query
+                                        norm_chunk = float(norm_chunk) if not isinstance(norm_chunk, (int, float)) else norm_chunk
+                                        
                                         if norm_query > 0 and norm_chunk > 0:
                                             similarity = dot_product / (norm_query * norm_chunk)
+                                            # Accept all similarities, even low ones - let sorting handle it
                                             embedding_results.append({
                                                 "chunk_id": chunk_id,
                                                 "chunk_data": chunk_data,
                                                 "score": float(similarity),
                                             })
+                                            self.logger.debug(f"Added chunk {chunk_id} with similarity {similarity:.4f}")
                                 except Exception as e:
-                                    self.logger.debug(f"Error calculating similarity for chunk {chunk_id}: {e}")
-                                    # Use default score if embedding fails
+                                    self.logger.warning(f"Error calculating similarity for chunk {chunk_id}: {e}")
+                                    # Use default score if embedding fails - still include the chunk
                                     embedding_results.append({
                                         "chunk_id": chunk_id,
                                         "chunk_data": chunk_data,
-                                        "score": 0.5,
+                                        "score": 0.1,  # Low but non-zero score
                                     })
                             except Exception as e:
                                 self.logger.debug(f"Error processing chunk {chunk_id}: {e}")
                                 continue
                         
+                        self.logger.info(f"Processed {processed_count} chunks, found {len(embedding_results)} with similarity scores")
+                        
                         # Sort by score
                         embedding_results.sort(key=lambda x: x["score"], reverse=True)
                         embedding_results = embedding_results[:top_k * 2]
+                        
+                        if embedding_results:
+                            top_scores = [f'{r["score"]:.4f}' for r in embedding_results[:5]]
+                            self.logger.info(f"Top similarity scores: {top_scores}")
                     
                     # Add embedding results to all_chunks
                     for item in embedding_results:
@@ -1350,7 +1444,7 @@ class QueryMixin:
         except Exception as e:
             self.logger.error(f"Error in document-filtered retrieval: {e}")
             import traceback
-            self.logger.debug(traceback.format_exc())
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return []
 
     async def aquery_all_documents(
@@ -1389,6 +1483,23 @@ class QueryMixin:
         # Get all document IDs (optionally filtered by metadata)
         all_docs = await self.get_all_documents(filter_metadata=filter_metadata)
         if not all_docs:
+            self.logger.warning("No documents found in storage. Storage may be empty or path may be incorrect.")
+            # Check if storage is actually empty
+            try:
+                if hasattr(self.lightrag, "doc_status") and self.lightrag.doc_status:
+                    # Try to get all doc IDs directly
+                    all_doc_ids = []
+                    if hasattr(self.lightrag.doc_status, "get_all_ids"):
+                        all_doc_ids = await self.lightrag.doc_status.get_all_ids()
+                    elif hasattr(self.lightrag.doc_status, "list_all"):
+                        all_doc_ids = await self.lightrag.doc_status.list_all()
+                    
+                    if not all_doc_ids:
+                        self.logger.error(f"Storage appears to be empty. Working directory: {getattr(self.config, 'working_dir', 'unknown')}")
+                        return "No documents found in storage. Please upload and process documents first."
+            except Exception as e:
+                self.logger.debug(f"Error checking storage: {e}")
+            
             return "No documents found matching the criteria."
         
         allowed_doc_ids = [doc["doc_id"] for doc in all_docs]
@@ -1408,6 +1519,8 @@ class QueryMixin:
         )
         
         if not retrieved_chunks:
+            self.logger.warning(f"No relevant chunks retrieved for query: {query[:100]}...")
+            self.logger.warning(f"Query was executed across {len(allowed_doc_ids)} documents but no matching content was found.")
             return "No relevant content found in the documents."
         
         # Group chunks by document
